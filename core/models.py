@@ -52,6 +52,13 @@ class SubmissionType(models.TextChoices):
     QUIZ = "quiz", "Quiz"
 
 
+class SubmissionStatus(models.TextChoices):
+    # docs.md Enum submission_status. Lifecycle of grading, not the skill type.
+    PENDING = "pending", "Pending"        # submitted, not yet graded
+    GRADED = "graded", "Graded"           # a human teacher left Feedback
+    AI_GRADED = "ai_graded", "AI Graded"  # an AI evaluator left Feedback
+
+
 # ---------- User ----------
 class UserManager(BaseUserManager):
     use_in_migrations = True
@@ -105,9 +112,10 @@ class User(AbstractBaseUser, PermissionsMixin):
 # ---------- Class ----------
 class Class(models.Model):
     class_name = models.CharField(max_length=100)
+    # docs.md classes.teacher_id [not null]. PROTECT: a teacher with classes
+    # cannot be deleted until their classes are reassigned.
     teacher = models.ForeignKey(
-        User, null=True, blank=True, on_delete=models.SET_NULL,
-        related_name="classes_taught",
+        User, on_delete=models.PROTECT, related_name="classes_taught",
     )
     academic_year = models.CharField(max_length=20, null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
@@ -201,8 +209,17 @@ class Exercise(models.Model):
     )
     title = models.CharField(max_length=255)
     exercise_type = models.CharField(max_length=20, choices=ExerciseType.choices)
+    # docs.md exercises.instructions — kept as prompt_text.
     prompt_text = models.TextField()
+    # docs.md exercises.content_text — reading passage body (receptive Reading).
+    content_text = models.TextField(null=True, blank=True)
+    # docs.md exercises.media_url — listening/speaking audio target.
     audio_prompt_url = models.CharField(max_length=500, null=True, blank=True)
+    # docs.md exercises.created_by — direct authorship (module may be null).
+    created_by = models.ForeignKey(
+        User, null=True, blank=True, on_delete=models.SET_NULL,
+        related_name="exercises_created",
+    )
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -252,13 +269,13 @@ class QuestionOption(models.Model):
 
 
 class Assignment(models.Model):
+    # docs.md assignments.class_id / exercise_id [not null]. Self-practice is
+    # modelled on Submission.assignment (nullable), NOT on Assignment.
     klass = models.ForeignKey(
-        Class, null=True, blank=True, on_delete=models.SET_NULL,
-        related_name="assignments",
+        Class, on_delete=models.CASCADE, related_name="assignments",
     )
     exercise = models.ForeignKey(
-        Exercise, null=True, blank=True, on_delete=models.SET_NULL,
-        related_name="assignments",
+        Exercise, on_delete=models.CASCADE, related_name="assignments",
     )
     assigned_by = models.ForeignKey(
         User, null=True, blank=True, on_delete=models.SET_NULL,
@@ -288,11 +305,17 @@ class Submission(models.Model):
     submission_type = models.CharField(max_length=20, choices=SubmissionType.choices)
     # Productive payload (writing/speaking).
     writing_text = models.TextField(null=True, blank=True)
-    audio_recording_url = models.CharField(max_length=500, null=True, blank=True)
+    audio_recording_url = models.TextField(null=True, blank=True)
     # Receptive payload (reading/listening/quiz): {question_id: [option_id, ...]}.
     answers = models.JSONField(null=True, blank=True)
     auto_score = models.DecimalField(
         max_digits=5, decimal_places=2, null=True, blank=True
+    )
+    # docs.md submissions.status — grading lifecycle.
+    status = models.CharField(
+        max_length=20,
+        choices=SubmissionStatus.choices,
+        default=SubmissionStatus.PENDING,
     )
     submitted_at = models.DateTimeField(auto_now_add=True)
 
@@ -346,6 +369,8 @@ class Feedback(models.Model):
         max_digits=5, decimal_places=2, null=True, blank=True
     )
     comments = models.TextField(null=True, blank=True)
+    # docs.md evaluations.is_ai_generated.
+    is_ai_generated = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -354,3 +379,108 @@ class Feedback(models.Model):
 
     def __str__(self):
         return f"Feedback {self.pk} on {self.submission_id}"
+
+
+# ---------- Study Material ----------
+class StudyMaterial(models.Model):
+    """Official reference document in the study-materials library.
+
+    A flat catalogue of static documents (docs.md `study_materials`, §5 Table 2):
+    Admins manage them, all roles read them. ``file_url`` is a mock string URL
+    (no real upload backend in this MVP — same convention as
+    ``Exercise.audio_prompt_url``). An optional ``klass`` scopes a document to a
+    single class; left null it is a global/official library document.
+    """
+
+    title = models.CharField(max_length=200)
+    file_url = models.CharField(max_length=255)  # mock string URL (no upload backend)
+    description = models.TextField(null=True, blank=True)
+    uploaded_by = models.ForeignKey(
+        User, null=True, blank=True, on_delete=models.SET_NULL,
+        related_name="study_materials",
+    )
+    # Optional class scope: null = global/official document, set = class-scoped.
+    klass = models.ForeignKey(
+        Class, null=True, blank=True, on_delete=models.CASCADE,
+        related_name="study_materials",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "study_materials"
+        ordering = ["-created_at", "id"]
+
+    def __str__(self):
+        return self.title
+
+
+# ---------- AI model registry (docs.md §4 ai_models / §5 Table 11) ----------
+class GradingStrictness(models.TextChoices):
+    """Admin-tunable rubric severity (RBAC row 13). The AI backend maps this to
+    its scoring curve; the mock backend uses it to scale the deterministic score."""
+    LENIENT = "lenient", "Lenient"
+    STANDARD = "standard", "Standard"
+    STRICT = "strict", "Strict"
+
+
+class AiModel(models.Model):
+    """A configurable multimodal-evaluation engine target. Admins register/edit
+    rows here (UC-20/21); the AI service layer reads the active row to decide
+    which endpoint/version/strictness to evaluate with. Only one row is treated
+    as the live model — see ``active()`` below."""
+
+    model_name = models.CharField(max_length=100)
+    endpoint_url = models.CharField(max_length=255)
+    version_identifier = models.CharField(max_length=50)
+    is_active = models.BooleanField(default=True)
+    strictness = models.CharField(
+        max_length=20,
+        choices=GradingStrictness.choices,
+        default=GradingStrictness.STANDARD,
+    )
+    updated_by = models.ForeignKey(
+        User, null=True, blank=True, on_delete=models.SET_NULL,
+        related_name="ai_models_updated",
+    )
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "ai_models"
+
+    def __str__(self):
+        return f"{self.model_name} ({self.version_identifier})"
+
+    @classmethod
+    def active(cls):
+        """The live model row, or ``None`` if none configured. Most-recently
+        updated active row wins, so toggling ``is_active`` on a newer row swaps
+        engines without disrupting in-flight evaluations (docs.md §5 Table 11)."""
+        return cls.objects.filter(is_active=True).order_by("-updated_at").first()
+
+
+# ---------- System Log (admin audit) ----------
+class SystemLog(models.Model):
+    """Administrative audit record (docs.md `system_logs`, §5 Table 12).
+
+    Append-only ledger of admin actions — primarily user status changes
+    (suspend/activate) and other governance events. ``admin`` is the actor
+    (nullable + SET_NULL so the trail survives if that admin is deleted);
+    ``target_status`` records the new status applied to a target user (e.g.
+    "suspended"), null for non-status actions. The rationale (docs.md §5
+    Table 12) is traceability over permission/status changes.
+    """
+
+    admin = models.ForeignKey(
+        User, null=True, blank=True, on_delete=models.SET_NULL,
+        related_name="system_logs",
+    )
+    action_description = models.TextField()
+    target_status = models.CharField(max_length=50, null=True, blank=True)
+    timestamp = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "system_logs"
+        ordering = ["-timestamp", "-id"]
+
+    def __str__(self):
+        return f"SystemLog {self.pk}: {self.action_description[:50]}"

@@ -38,3 +38,28 @@ class IsTeacherOrAdmin(_RolePermission):
 
 class IsStudent(_RolePermission):
     allowed_roles = (UserRole.STUDENT,)
+
+
+def can_view_submission_feedback(user, submission) -> bool:
+    """True if `user` may read feedback on `submission`.
+
+    Allowed: the submission's student (owner), the teacher who owns the
+    submission's class (via assignment.klass.teacher), a teacher who reviewed
+    it, or any admin. Mirrors REFACTOR_PLAN §4 and docs.md RBAC rows 10-11.
+
+    Per docs.md §6 safeguard 1 (Nullable Evaluator), do NOT assume a reviewer
+    exists: feedback can be AI-generated (reviewer_id null).
+    """
+    if user.role == UserRole.ADMIN:
+        return True
+    if submission.student_id == user.id:
+        return True
+    if user.role == UserRole.TEACHER:
+        # Class teacher (assignment may be null for ad-hoc practice subs).
+        assignment = submission.assignment
+        if assignment and assignment.klass_id and assignment.klass.teacher_id == user.id:
+            return True
+        # Teacher who authored a feedback row on this submission (reviewer).
+        if submission.feedback.filter(reviewer_id=user.id).exists():
+            return True
+    return False

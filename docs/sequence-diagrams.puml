@@ -1,0 +1,207 @@
+' English Learning Platform — Sequence Diagrams
+' Render at https://plantuml.com/ (or any PlantUML renderer).
+' Backend: Django + DRF + rest_framework_simplejwt (english-learning-api)
+' Frontend: Next.js (english-learning-web)
+' Each @startuml/@enduml block is a separate diagram.
+
+'==================================================================
+' FLOW 1 — REGISTER (with auto-login)
+'==================================================================
+@startuml register
+title Register (POST /api/auth/register) + auto-login
+autonumber
+
+actor User
+participant "RegisterPage\n(app/(auth)/register)" as Page
+participant "api.ts\n(API client)" as API
+participant "RegisterView\n(core/views.py)" as View
+participant "RegisterSerializer\n(core/serializers.py)" as Ser
+database "User table\n(core/models.py)" as DB
+
+User -> Page : fill full_name, email,\npassword, role
+Page -> API : register({full_name,email,password,role})
+API -> View : POST /api/auth/register
+View -> Ser : validate(payload)
+Ser -> DB : email unique? (check)
+alt email already exists
+  Ser --> View : ValidationError
+  View --> API : 400 Bad Request
+  API --> Page : error
+  Page --> User : show "email taken"
+else valid
+  Ser -> DB : User.objects.create_user()\n(set_password → PBKDF2 hash)
+  DB --> Ser : User (status=ACTIVE)
+  Ser --> View : User
+  View --> API : 201 Created (UserSerializer)
+  API -> API : auto-call login(email,password)
+  note right of API : continues into LOGIN flow
+  API --> Page : User
+  Page --> User : redirect to app
+end
+@enduml
+
+'==================================================================
+' FLOW 2 — LOGIN
+'==================================================================
+@startuml login
+title Login (POST /api/auth/login) — JWT issue
+autonumber
+
+actor User
+participant "LoginPage\n(app/(auth)/login)" as Page
+participant "api.ts\n(API client)" as API
+participant "LoginView\n(core/views.py)" as View
+participant "Django authenticate()" as Auth
+participant "SimpleJWT\nRefreshToken.for_user" as JWT
+database "User table" as DB
+
+User -> Page : enter email, password
+Page -> API : login(email, password)
+API -> View : POST /api/auth/login
+View -> Auth : authenticate(username=email, password)
+Auth -> DB : fetch user + verify hash
+alt invalid credentials
+  Auth --> View : None
+  View --> API : 401 AuthenticationFailed\n"Incorrect email or password"
+  API --> Page : error
+  Page --> User : show error
+else valid
+  Auth --> View : User
+  View -> JWT : RefreshToken.for_user(user)
+  JWT --> View : access (60 min) + refresh (7 d)
+  View --> API : 200 {access_token, refresh_token,\ntoken_type:"bearer"}
+  API -> API : setAccessToken() → memory\nsetRefreshToken() → localStorage[elw_refresh_token]
+  API -> View : GET /api/auth/me (Bearer access)
+  View --> API : current User
+  API --> Page : User
+  Page --> User : redirect to app
+end
+
+== later: access expires (any request → 401) ==
+API -> View : POST /api/auth/token/refresh {refresh}
+View -> JWT : validate + rotate
+JWT --> View : new access (+ refresh)
+View --> API : 200 new tokens
+API -> API : retry original request transparently
+@enduml
+
+'==================================================================
+' FLOW 3 — TEACHER: CREATE CLASS, CREATE ASSIGNMENT
+'==================================================================
+@startuml teacher-class-assignment
+title Teacher — Create Class & Create Assignment
+autonumber
+
+actor Teacher
+participant "Frontend\n(classes pages)" as Page
+participant "api.ts\n(API client)" as API
+participant "ClassViewSet\n(core/views.py)" as VS
+participant "Serializers\n(Class / Assignment)" as Ser
+database "DB\n(Class, Assignment, Exercise)" as DB
+participant "WebSocket\nclass group" as WS
+
+== Create Class ==
+Teacher -> Page : new class {class_name, academic_year?}
+Page -> API : createClass(body)
+API -> VS : POST /api/classes/  (Bearer)
+VS -> VS : perm IsTeacherOrAdmin + IsActiveUser
+VS -> Ser : validate
+VS -> VS : perform_create():\nteacher = request.user
+Ser -> DB : INSERT Class (teacher FK)
+DB --> Ser : Class
+VS --> API : 201 {id, class_name, teacher_id, ...}
+API --> Page : Class
+Page --> Teacher : show class
+
+== Create Assignment (in a class) ==
+Teacher -> Page : new assignment {exercise_id, due_date?}
+Page -> API : createAssignment(classId, body)
+API -> VS : POST /api/classes/{id}/assignments/
+VS -> VS : _require_class_owner()\n(teacher owns this class?)
+alt not owner / not teacher
+  VS --> API : 403 Forbidden
+  API --> Teacher : denied
+else owner
+  VS -> Ser : validate (exercise_id, due_date)
+  Ser -> DB : INSERT Assignment\n(klass=cls, exercise, assigned_by=user)
+  DB --> Ser : Assignment
+  VS -> WS : broadcast {event:"assignment_created",\nassignment_id, exercise_id, due_date}
+  WS --> Page : live update (enrolled students)
+  VS --> API : 201 {id, class_id, exercise_id, ...}
+  API --> Teacher : show assignment
+end
+note over DB : Enrolled students (ClassStudent)\nimplicitly receive the assignment
+@enduml
+
+'==================================================================
+' FLOW 4 — STUDENT SUBMIT → AI / TEACHER FEEDBACK → STUDENT REVIEW
+'==================================================================
+@startuml submit-feedback-review
+title Submit Exercise → AI / Teacher Feedback → Student Review
+autonumber
+
+actor Student
+actor Teacher
+participant "Frontend" as FE
+participant "api.ts" as API
+participant "SubmissionViewSet\n/ FeedbackViewSet" as VS
+participant "ai/service.py\n(evaluate_submission)" as AI
+participant "MockBackend\n(RealBackend stub)" as BE
+database "DB\n(Submission, Feedback)" as DB
+participant "WebSocket\nclass group" as WS
+
+== 1. Student submits ==
+Student -> FE : answer / write / record (exercise [id])
+FE -> API : createSubmission({exercise_id, submission_type,\nwriting_text|audio_url|answers})
+API -> VS : POST /api/submissions/  (IsStudent)
+VS -> DB : INSERT Submission\n(student=user, status=pending)
+alt receptive (reading/listening/quiz)
+  VS -> DB : submission.grade()\n(answers vs is_correct → auto_score)
+end
+VS --> API : 201 {id, status:pending, auto_score?}
+API --> Student : submitted
+
+== 2a. AI feedback (teacher-triggered or student self-practice) ==
+alt Teacher requests AI eval
+  Teacher -> FE : "Request AI feedback" (submissions [id])
+  FE -> API : aiEvaluateSubmission(id)
+  API -> VS : POST /api/submissions/{id}/ai-evaluate/\n(IsTeacherOrAdmin)
+else Student self-practice (no assignment)
+  Student -> FE : "Get AI feedback" (writing/speaking)
+  FE -> API : aiPractice({exercise_id, writing_text|audio_url})
+  API -> VS : POST /api/submissions/ai-practice/ (IsStudent)
+  VS -> DB : INSERT Submission (assignment=null)
+end
+VS -> AI : evaluate_submission(submission)
+AI -> BE : grade_submission()  [AI_BACKEND=mock by default]
+note right of BE : MOCK: deterministic rubric scoring.\nRealBackend (OpenAI/Whisper) = stub, NotImplemented.
+BE --> AI : {score, comments, transcript?}
+AI -> DB : INSERT Feedback\n(reviewer=null, is_ai_generated=true)
+AI -> DB : Submission.status = AI_GRADED
+AI --> VS : Feedback
+VS --> API : 201 Feedback (+submission if practice)
+API --> Student : AI feedback shown
+
+== 2b. Teacher feedback ==
+Teacher -> FE : enter score + comments (TeacherGradingScreen)
+FE -> API : createFeedback({submission_id, score, comments})
+API -> VS : POST /api/feedback/  (IsTeacherOrAdmin)
+VS -> DB : INSERT Feedback\n(reviewer=teacher, is_ai_generated=false)
+VS -> DB : Submission.status = GRADED
+VS -> WS : broadcast {event:"feedback_posted",\nsubmission_id, score}
+VS --> API : 201 Feedback
+API --> Teacher : posted
+
+== 3. Student review ==
+Student -> FE : open My Submissions
+FE -> API : listMySubmissions()
+API -> VS : GET /api/submissions/me/
+VS -> DB : SELECT submissions (student)
+VS --> API : 200 [submissions]
+Student -> FE : open submission [id]
+FE -> API : getSubmissionFeedback(id)
+API -> VS : GET /api/submissions/{id}/feedback/\n(can_view_submission_feedback)
+VS -> DB : SELECT Feedback WHERE submission=id
+VS --> API : 200 [Feedback...] (AI + teacher, 1:many)
+API --> Student : render score + comments\n(label AI vs Teacher)
+@enduml

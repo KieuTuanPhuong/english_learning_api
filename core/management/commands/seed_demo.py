@@ -25,12 +25,18 @@ from core.models import (
     Feedback,
     LearningModule,
     LessonPlan,
+    Question,
+    QuestionOption,
     StudentModuleProgress,
     Submission,
     SubmissionType,
+    SubmissionStatus,
     User,
     UserRole,
     UserStatus,
+    StudyMaterial,
+    AiModel,
+    SystemLog,
 )
 
 PASSWORD = "password123"
@@ -47,12 +53,15 @@ class Command(BaseCommand):
         Submission.objects.all().delete()
         Assignment.objects.all().delete()
         StudentModuleProgress.objects.all().delete()
+        StudyMaterial.objects.all().delete()
         Exercise.objects.all().delete()
         LearningModule.objects.all().delete()
         LessonPlan.objects.all().delete()
         ClassStudent.objects.all().delete()
         Class.objects.all().delete()
         User.objects.all().delete()
+        AiModel.objects.all().delete()
+        SystemLog.objects.all().delete()
 
         # ---------- Users ----------
         self.stdout.write("Seeding users…")
@@ -168,53 +177,230 @@ class Command(BaseCommand):
             Exercise.objects.create(module=modules[0], title="Ordering at a cafe",
                 exercise_type=ExerciseType.SPEAKING,
                 prompt_text="Record yourself ordering a coffee and a pastry.",
-                audio_prompt_url="https://mock.cdn/audio/cafe-order.mp3"),
+                audio_prompt_url="https://mock.cdn/audio/cafe-order.mp3",
+                created_by=teachers[1]),
             Exercise.objects.create(module=modules[0], title="Asking for directions",
                 exercise_type=ExerciseType.WRITING,
-                prompt_text="Write a short dialogue asking a stranger for directions to the train station."),
+                prompt_text="Write a short dialogue asking a stranger for directions to the train station.",
+                created_by=teachers[1]),
             Exercise.objects.create(module=modules[0], title="Greetings quiz",
                 exercise_type=ExerciseType.QUIZ,
-                prompt_text="Which greeting is most appropriate in a business meeting? Explain why."),
+                prompt_text="Which greeting is most appropriate in a business meeting? Explain why.",
+                created_by=teachers[1]),
             Exercise.objects.create(module=modules[1], title="Past simple vs present perfect",
                 exercise_type=ExerciseType.WRITING,
-                prompt_text="Write 5 sentences contrasting past simple and present perfect tense."),
+                prompt_text="Write 5 sentences contrasting past simple and present perfect tense.",
+                created_by=teachers[0]),
             Exercise.objects.create(module=modules[1], title="Articles practice",
                 exercise_type=ExerciseType.QUIZ,
-                prompt_text="Fill in the blanks: ___ apple, ___ honest person, ___ university."),
+                prompt_text="Fill in the blanks: ___ apple, ___ honest person, ___ university.",
+                created_by=teachers[0]),
             Exercise.objects.create(module=modules[1], title="Preposition story",
                 exercise_type=ExerciseType.WRITING,
-                prompt_text="Write a short story (100 words) using 'in', 'on', 'at' correctly."),
+                prompt_text="Write a short story (100 words) using 'in', 'on', 'at' correctly.",
+                created_by=teachers[0]),
             Exercise.objects.create(module=modules[2], title="Thesis statement workshop",
                 exercise_type=ExerciseType.WRITING,
-                prompt_text="Write three different thesis statements arguing about social media's impact on teens."),
+                prompt_text="Write three different thesis statements arguing about social media's impact on teens.",
+                created_by=teachers[0]),
             Exercise.objects.create(module=modules[2], title="Persuasive essay",
                 exercise_type=ExerciseType.WRITING,
-                prompt_text="Write a 5-paragraph persuasive essay (~400 words) on: 'Should schools require uniforms?'"),
+                prompt_text="Write a 5-paragraph persuasive essay (~400 words) on: 'Should schools require uniforms?'",
+                created_by=teachers[0]),
             Exercise.objects.create(module=modules[2], title="Transitions quiz",
                 exercise_type=ExerciseType.QUIZ,
-                prompt_text="Name 5 transition words for contrast and 5 for cause/effect."),
+                prompt_text="Name 5 transition words for contrast and 5 for cause/effect.",
+                created_by=teachers[0]),
             Exercise.objects.create(module=modules[3], title="Minimal pairs: ship vs sheep",
                 exercise_type=ExerciseType.SPEAKING,
                 prompt_text="Record yourself saying these word pairs: ship/sheep, bit/beat, fit/feet.",
-                audio_prompt_url="https://mock.cdn/audio/minimal-pairs.mp3"),
+                audio_prompt_url="https://mock.cdn/audio/minimal-pairs.mp3",
+                created_by=teachers[1]),
             Exercise.objects.create(module=modules[3], title="Intonation practice",
                 exercise_type=ExerciseType.SPEAKING,
                 prompt_text="Read the provided paragraph aloud, paying attention to falling intonation on statements.",
-                audio_prompt_url="https://mock.cdn/audio/intonation.mp3"),
+                audio_prompt_url="https://mock.cdn/audio/intonation.mp3",
+                created_by=teachers[1]),
             Exercise.objects.create(module=modules[4], title="IELTS Writing Task 2 — Opinion",
                 exercise_type=ExerciseType.WRITING,
-                prompt_text="Some people believe technology has made us less social. To what extent do you agree? Write 250+ words."),
+                prompt_text="Some people believe technology has made us less social. To what extent do you agree? Write 250+ words.",
+                created_by=teachers[2]),
             Exercise.objects.create(module=modules[4], title="IELTS Speaking Part 2",
                 exercise_type=ExerciseType.SPEAKING,
                 prompt_text="Describe a place you have visited recently. You should say where it is, when you went, what you did, and why you enjoyed it. Speak for 1-2 minutes.",
-                audio_prompt_url="https://mock.cdn/audio/ielts-part2.mp3"),
+                audio_prompt_url="https://mock.cdn/audio/ielts-part2.mp3",
+                created_by=teachers[2]),
             Exercise.objects.create(module=modules[4], title="IELTS vocabulary quiz",
                 exercise_type=ExerciseType.QUIZ,
-                prompt_text="Provide synonyms for: ubiquitous, ameliorate, paradigm, scrutinize."),
+                prompt_text="Provide synonyms for: ubiquitous, ameliorate, paradigm, scrutinize.",
+                created_by=teachers[2]),
             Exercise.objects.create(module=modules[4], title="IELTS Writing Task 1 — Chart",
                 exercise_type=ExerciseType.WRITING,
-                prompt_text="The chart shows energy consumption by source from 2000-2020. Summarise the key trends in 150+ words."),
+                prompt_text="The chart shows energy consumption by source from 2000-2020. Summarise the key trends in 150+ words.",
+                created_by=teachers[2]),
+            # NEW: a reading-comprehension exercise that uses content_text (passage)
+            # + prompt_text (instructions). created_by = module owner.
+            Exercise.objects.create(module=modules[1], title="Reading: A Day at the Market",
+                exercise_type=ExerciseType.READING,
+                prompt_text="Read the passage, then answer the comprehension questions.",
+                content_text=(
+                    "Every Saturday, Mai visits the local market near her home. She buys "
+                    "fresh vegetables, ripe mangoes, and a loaf of warm bread. The vendors "
+                    "know her by name and often save the best fruit for her. By nine o'clock "
+                    "the market is crowded, so Mai always arrives early to avoid the rush."
+                ),
+                created_by=teachers[0]),
+            Exercise.objects.create(module=modules[4], title="Reading: The Future of Work",
+                exercise_type=ExerciseType.READING,
+                prompt_text="Read the passage and answer the questions that follow.",
+                content_text=(
+                    "Remote work, once a rare privilege, has become a permanent fixture for "
+                    "millions. Proponents cite flexibility and the elimination of commutes, "
+                    "while critics warn of blurred boundaries between home and office. As "
+                    "companies experiment with hybrid models, the definition of a 'workplace' "
+                    "continues to evolve."
+                ),
+                created_by=teachers[2]),
+            # NEW: listening exercises — stimulus = audio_prompt_url; transcript kept in
+            # content_text for reference (the client may keep it hidden).
+            Exercise.objects.create(module=modules[0], title="Listening: A Voicemail Message",
+                exercise_type=ExerciseType.LISTENING,
+                prompt_text="Listen to the voicemail and answer the questions. You may listen twice.",
+                content_text=(
+                    "Transcript — Hi Sarah, it's Mark from the dentist's office. I'm calling to "
+                    "confirm your appointment on Thursday at 2 p.m. If you need to reschedule, "
+                    "please call us back before Wednesday evening. Thank you!"
+                ),
+                audio_prompt_url="https://mock.cdn/audio/voicemail-dentist.mp3",
+                created_by=teachers[1]),
+            Exercise.objects.create(module=modules[4], title="Listening: Weather Forecast",
+                exercise_type=ExerciseType.LISTENING,
+                prompt_text="Listen to the weather forecast and answer the questions.",
+                content_text=(
+                    "Transcript — Good morning. Today will start cloudy with light rain in the "
+                    "morning, clearing by the afternoon. Temperatures will reach a high of "
+                    "eighteen degrees. Tomorrow looks sunny and warmer, so it's a good day for "
+                    "outdoor plans."
+                ),
+                audio_prompt_url="https://mock.cdn/audio/weather-forecast.mp3",
+                created_by=teachers[2]),
         ]
+
+        # ---------- Questions & Options (receptive auto-graded items) ----------
+        # Each question's answer key is the option(s) flagged is_correct;
+        # Submission.grade() scores a student's `answers` ({question_id: [option_id,...]})
+        # against that key. "Word filling" gap-fills are modeled as single-correct-option
+        # questions so they auto-grade today (free-text fill-in needs backend support —
+        # see english-learning-web/docs/READING_LISTENING_QUIZ_PLAN.md).
+        self.stdout.write("Seeding questions & options…")
+
+        def make_questions(exercise, specs):
+            """specs: list of (text, [(option_text, is_correct), ...]). Returns [Question]."""
+            created = []
+            for q_order, (q_text, opts) in enumerate(specs, start=1):
+                q = Question.objects.create(exercise=exercise, text=q_text, order=q_order)
+                for o_order, (o_text, correct) in enumerate(opts, start=1):
+                    QuestionOption.objects.create(
+                        question=q, text=o_text, is_correct=correct, order=o_order)
+                created.append(q)
+            return created
+
+        # exercises[15] = Reading: A Day at the Market (beginner)
+        market_qs = make_questions(exercises[15], [
+            ("How often does Mai visit the local market?", [
+                ("Every Saturday", True),
+                ("Every Sunday", False),
+                ("Every morning", False),
+                ("Once a month", False),
+            ]),
+            ("Why does Mai always arrive early?", [
+                ("To meet her friends", False),
+                ("To avoid the crowd", True),
+                ("Because the market closes early", False),
+                ("To get a discount", False),
+            ]),
+            ("True or False: The vendors do not recognise Mai.", [
+                ("True", False),
+                ("False", True),
+            ]),
+            # Word filling (gap-fill, choose the missing word)
+            ("Fill the gap: Mai buys fresh vegetables, ripe ___, and a loaf of warm bread.", [
+                ("mangoes", True),
+                ("apples", False),
+                ("potatoes", False),
+                ("flowers", False),
+            ]),
+        ])
+
+        # exercises[16] = Reading: The Future of Work (advanced)
+        make_questions(exercises[16], [
+            ("According to the passage, remote work has become:", [
+                ("a rare privilege", False),
+                ("a permanent fixture", True),
+                ("an illegal practice", False),
+                ("a temporary trend", False),
+            ]),
+            ("What do critics of remote work warn about?", [
+                ("Higher salaries", False),
+                ("Blurred boundaries between home and office", True),
+                ("Too many commutes", False),
+                ("A lack of technology", False),
+            ]),
+            ("Fill the gap: Companies are experimenting with ___ models.", [
+                ("hybrid", True),
+                ("ancient", False),
+                ("broken", False),
+                ("silent", False),
+            ]),
+        ])
+
+        # exercises[17] = Listening: A Voicemail Message (beginner)
+        make_questions(exercises[17], [
+            ("Who is calling Sarah?", [
+                ("Her doctor", False),
+                ("Mark from the dentist's office", True),
+                ("Her manager", False),
+                ("A delivery driver", False),
+            ]),
+            ("When is the appointment?", [
+                ("Wednesday at 2 p.m.", False),
+                ("Thursday at 2 p.m.", True),
+                ("Thursday at 10 a.m.", False),
+                ("Friday at 2 p.m.", False),
+            ]),
+            ("True or False: Sarah must call back before Wednesday evening to reschedule.", [
+                ("True", True),
+                ("False", False),
+            ]),
+            ("Fill the gap: You should call back before ___ evening to reschedule.", [
+                ("Wednesday", True),
+                ("Thursday", False),
+                ("Tuesday", False),
+                ("Friday", False),
+            ]),
+        ])
+
+        # exercises[18] = Listening: Weather Forecast (advanced)
+        make_questions(exercises[18], [
+            ("What is the weather like in the morning?", [
+                ("Sunny and warm", False),
+                ("Cloudy with light rain", True),
+                ("Snowy", False),
+                ("Foggy all day", False),
+            ]),
+            ("What is today's high temperature?", [
+                ("Eight degrees", False),
+                ("Eighteen degrees", True),
+                ("Eighty degrees", False),
+                ("Twenty-eight degrees", False),
+            ]),
+            ("Fill the gap: Tomorrow looks ___ and warmer.", [
+                ("sunny", True),
+                ("rainy", False),
+                ("windy", False),
+                ("cold", False),
+            ]),
+        ])
 
         # ---------- Assignments ----------
         self.stdout.write("Seeding assignments…")
@@ -291,6 +477,32 @@ class Command(BaseCommand):
             submission_type=SubmissionType.SPEAKING,
             audio_recording_url="https://mock.cdn/recordings/bob-pronunciation.m4a"))
 
+        # Receptive auto-graded demo submissions: build `answers` from the answer key and
+        # call grade() to populate auto_score (shows the quiz scoring end-to-end).
+        def answer_key(questions):
+            return {
+                str(q.id): [o.id for o in q.options.all() if o.is_correct]
+                for q in questions
+            }
+
+        market_key = answer_key(market_qs)
+        # Alice answers the market reading perfectly → 100.
+        sub_full = Submission.objects.create(
+            assignment=None, exercise=exercises[15], student=students[0],
+            submission_type=SubmissionType.READING, answers=market_key)
+        sub_full.grade()
+        sub_full.save(update_fields=["auto_score"])
+        # Bob gets two of four wrong (clears first + last question picks) → 50.
+        market_partial = {qid: ids[:] for qid, ids in market_key.items()}
+        q_ids = list(market_partial.keys())
+        market_partial[q_ids[0]] = []
+        market_partial[q_ids[-1]] = []
+        sub_partial = Submission.objects.create(
+            assignment=None, exercise=exercises[15], student=students[1],
+            submission_type=SubmissionType.READING, answers=market_partial)
+        sub_partial.grade()
+        sub_partial.save(update_fields=["auto_score"])
+
         # ---------- Feedback ----------
         self.stdout.write("Seeding feedback…")
         Feedback.objects.bulk_create([
@@ -324,6 +536,12 @@ class Command(BaseCommand):
                      score=Decimal("70.00"), comments="Second sentence — well done."),
         ])
 
+        # Reflect grading lifecycle in submissions status
+        graded_idx = [0, 1, 2, 4, 5, 9, 10, 13, 14, 17, 18, 19, 21, 24]
+        for i in graded_idx:
+            submissions[i].status = SubmissionStatus.GRADED
+            submissions[i].save(update_fields=["status"])
+
         # ---------- Progress ----------
         self.stdout.write("Seeding progress…")
         StudentModuleProgress.objects.bulk_create([
@@ -345,18 +563,54 @@ class Command(BaseCommand):
                 completion_percentage=Decimal("100.00"), last_accessed_at=now - timedelta(days=1)),
         ])
 
+        # ---------- Study Materials ----------
+        self.stdout.write("Seeding study materials…")
+        StudyMaterial.objects.bulk_create([
+            StudyMaterial(
+                title="English Grammar Handbook (PDF)",
+                file_url="https://mock.cdn/docs/grammar-handbook.pdf",
+                description="Comprehensive reference: tenses, articles, prepositions.",
+                uploaded_by=admin),
+            StudyMaterial(
+                title="IELTS Writing Band Descriptors",
+                file_url="https://mock.cdn/docs/ielts-writing-descriptors.pdf",
+                description="Official band 5–9 criteria for Writing Task 1 & 2.",
+                uploaded_by=admin),
+            StudyMaterial(
+                title="Common Phrasal Verbs Cheat Sheet",
+                file_url="https://mock.cdn/docs/phrasal-verbs.pdf",
+                description="Must-know phrasal verbs for everyday conversations.",
+                uploaded_by=admin,
+                klass=classes[0]),
+        ])
+
+        # ---------- AI Models ----------
+        self.stdout.write("Seeding AI models…")
+        AiModel.objects.create(
+            model_name="GPT-4o English Evaluator",
+            endpoint_url="https://api.openai.com/v1/chat/completions",
+            version_identifier="gpt-4o-2024-05-13",
+            is_active=True,
+            updated_by=admin,
+        )
+
         self.stdout.write(self.style.SUCCESS("\n=== Seed complete ==="))
         self.stdout.write(
-            f"  Users:        {User.objects.count():>4}  (1 admin, 3 teachers, 12 students — 1 suspended)")
-        self.stdout.write(f"  Classes:      {Class.objects.count():>4}")
-        self.stdout.write(f"  Enrollments:  {ClassStudent.objects.count():>4}")
-        self.stdout.write(f"  LessonPlans:  {LessonPlan.objects.count():>4}")
-        self.stdout.write(f"  Modules:      {LearningModule.objects.count():>4}")
-        self.stdout.write(f"  Exercises:    {Exercise.objects.count():>4}")
-        self.stdout.write(f"  Assignments:  {Assignment.objects.count():>4}")
-        self.stdout.write(f"  Submissions:  {Submission.objects.count():>4}")
-        self.stdout.write(f"  Feedback:     {Feedback.objects.count():>4}")
-        self.stdout.write(f"  Progress:     {StudentModuleProgress.objects.count():>4}")
+            f"  Users:            {User.objects.count():>4}  (1 admin, 3 teachers, 12 students — 1 suspended)")
+        self.stdout.write(f"  Classes:          {Class.objects.count():>4}")
+        self.stdout.write(f"  Enrollments:      {ClassStudent.objects.count():>4}")
+        self.stdout.write(f"  LessonPlans:      {LessonPlan.objects.count():>4}")
+        self.stdout.write(f"  Modules:          {LearningModule.objects.count():>4}")
+        self.stdout.write(f"  Exercises:        {Exercise.objects.count():>4}")
+        self.stdout.write(f"  Questions:        {Question.objects.count():>4}")
+        self.stdout.write(f"  Question Options: {QuestionOption.objects.count():>4}")
+        self.stdout.write(f"  Assignments:      {Assignment.objects.count():>4}")
+        self.stdout.write(f"  Submissions:      {Submission.objects.count():>4}")
+        self.stdout.write(f"  Feedback:         {Feedback.objects.count():>4}")
+        self.stdout.write(f"  Progress:         {StudentModuleProgress.objects.count():>4}")
+        self.stdout.write(f"  Study Materials:  {StudyMaterial.objects.count():>4}")
+        self.stdout.write(f"  AI Models:        {AiModel.objects.count():>4}")
+        self.stdout.write(f"  System Logs:      {SystemLog.objects.count():>4}")
         self.stdout.write("\nLogin (password for everyone): password123")
         self.stdout.write("  Admin:    admin@english.app  (also Django /admin/ superuser)")
         self.stdout.write("  Teachers: emma/david/sophie .teacher@english.app")
