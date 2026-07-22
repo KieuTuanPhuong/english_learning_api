@@ -24,6 +24,7 @@ ALLOWED_HOSTS = os.getenv("ALLOWED_HOSTS", "*").split(",")
 # Application definition
 
 INSTALLED_APPS = [
+    "daphne",                 # Daphne must precede django.contrib.staticfiles
     "django.contrib.admin",
     "django.contrib.auth",
     "django.contrib.contenttypes",
@@ -31,13 +32,17 @@ INSTALLED_APPS = [
     "django.contrib.messages",
     "django.contrib.staticfiles",
     # third-party
+    "channels",
+    "corsheaders",
     "rest_framework",
     "rest_framework_simplejwt",
+    "drf_spectacular",
     # local
     "core",
 ]
 
 MIDDLEWARE = [
+    "corsheaders.middleware.CorsMiddleware",
     "django.middleware.security.SecurityMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
@@ -66,6 +71,7 @@ TEMPLATES = [
 ]
 
 WSGI_APPLICATION = "config.wsgi.application"
+ASGI_APPLICATION = "config.asgi.application"
 
 
 # Database — parse the FastAPI-style DATABASE_URL (strip any +driver suffix).
@@ -104,6 +110,44 @@ REST_FRAMEWORK = {
         "rest_framework.permissions.IsAuthenticated",
         "core.permissions.IsActiveUser",
     ),
+    # OpenAPI 3 schema generation (drf-spectacular).
+    "DEFAULT_SCHEMA_CLASS": "drf_spectacular.openapi.AutoSchema",
+}
+
+# OpenAPI / API docs. The front-end fetches the machine-readable schema from
+# /api/schema/ (JSON or YAML) and renders docs / generates a typed client.
+SPECTACULAR_SETTINGS = {
+    "TITLE": "English Learning API",
+    "DESCRIPTION": (
+        "REST API for the English-learning platform: users, classes, learning "
+        "modules, exercises, submissions, feedback and progress. JWT auth."
+    ),
+    "VERSION": "1.0.0",
+    "SERVE_INCLUDE_SCHEMA": False,
+    # ExerciseType and SubmissionType share identical member values
+    # (writing/speaking/reading/listening/quiz), so they collapse to one enum
+    # component. Name that shared set explicitly to silence the rename warning.
+    "ENUM_NAME_OVERRIDES": {
+        "SkillTypeEnum": "core.models.ExerciseType.choices",
+    },
+    # Bearer JWT — show the Authorize button in Swagger UI.
+    "SECURITY": [{"jwtAuth": []}],
+    "COMPONENT_SPLIT_REQUEST": True,
+    "TAGS": [
+        {"name": "auth", "description": "Registration, login, JWT tokens"},
+        {"name": "users", "description": "User accounts and self-profile"},
+        {"name": "classes", "description": "Classes, enrollment, lesson plans, assignments"},
+        {"name": "modules", "description": "Learning modules and their exercises"},
+        {"name": "exercises", "description": "Exercises and their submissions"},
+        {"name": "submissions", "description": "Student submissions and auto-grading"},
+        {"name": "feedback", "description": "Reviewer feedback on submissions"},
+        {"name": "progress", "description": "Per-student module progress"},
+        {"name": "study-materials", "description": "Official study documents: Admin-managed, read by all"},
+        {"name": "dashboard", "description": "Role-aware dashboard aggregates (student/teacher/admin)"},
+        {"name": "reports", "description": "Analytical grade-report export (CSV; PDF deferred)"},
+        {"name": "ai", "description": "Admin AI ML configuration and automated grading actions"},
+        {"name": "admin", "description": "Platform management, health status, activity feed"},
+    ],
 }
 
 SIMPLE_JWT = {
@@ -115,6 +159,13 @@ SIMPLE_JWT = {
     # under PyJWT >= 2.10, which rejects a non-string "sub" claim.
 }
 
+# CORS settings
+CORS_ALLOWED_ORIGINS = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+]
+CORS_ALLOW_CREDENTIALS = True
+
 
 LANGUAGE_CODE = "en-us"
 TIME_ZONE = "UTC"
@@ -123,3 +174,23 @@ USE_TZ = True
 
 STATIC_URL = "static/"
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
+
+# AI grading integration settings
+AI_BACKEND = os.getenv("AI_BACKEND", "mock").lower()
+
+# Reports — PDF export is deferred behind reportlab; CSV is always available.
+REPORTS_PDF_ENABLED = os.getenv("REPORTS_PDF_ENABLED", "false").lower() == "true"
+
+# Real-time channel layer. Dev = in-memory (single process, no broker).
+# Prod = Redis (set REDIS_URL); requires `channels-redis` + a real ASGI server.
+if os.getenv("REDIS_URL"):
+    CHANNEL_LAYERS = {
+        "default": {
+            "BACKEND": "channels_redis.core.RedisChannelLayer",
+            "CONFIG": {"hosts": [os.getenv("REDIS_URL")]},
+        }
+    }
+else:
+    CHANNEL_LAYERS = {
+        "default": {"BACKEND": "channels.layers.InMemoryChannelLayer"}
+    }

@@ -22,6 +22,9 @@ from .models import (
     StudentModuleProgress,
     Submission,
     User,
+    StudyMaterial,
+    AiModel,
+    SystemLog,
 )
 
 
@@ -134,10 +137,10 @@ class QuestionInline(admin.TabularInline):
 
 @admin.register(Exercise)
 class ExerciseAdmin(admin.ModelAdmin):
-    list_display = ("id", "title", "exercise_type", "module", "created_at")
+    list_display = ("id", "title", "exercise_type", "module", "created_by", "created_at")
     list_filter = ("exercise_type",)
-    search_fields = ("title", "prompt_text")
-    raw_id_fields = ("module",)
+    search_fields = ("title", "prompt_text", "content_text")
+    raw_id_fields = ("module", "created_by")
     inlines = [QuestionInline]
 
 
@@ -176,13 +179,41 @@ class FeedbackInline(admin.StackedInline):
 
 @admin.register(Submission)
 class SubmissionAdmin(admin.ModelAdmin):
-    list_display = ("id", "student", "exercise", "submission_type", "auto_score", "submitted_at")
-    list_filter = ("submission_type",)
+    list_display = ("id", "student", "exercise", "submission_type", "status", "auto_score", "submitted_at")
+    list_filter = ("submission_type", "status")
     raw_id_fields = ("assignment", "exercise", "student")
     inlines = [FeedbackInline]
 
 
 @admin.register(Feedback)
 class FeedbackAdmin(admin.ModelAdmin):
-    list_display = ("id", "submission", "reviewer", "score", "created_at")
+    list_display = ("id", "submission", "reviewer", "score", "is_ai_generated", "created_at")
+    list_filter = ("is_ai_generated",)
     raw_id_fields = ("submission", "reviewer")
+
+
+# ---------- Study Materials ----------
+@admin.register(StudyMaterial)
+class StudyMaterialAdmin(admin.ModelAdmin):
+    list_display = ("id", "title", "uploaded_by", "klass", "created_at")
+    list_filter = ("created_at",)
+    search_fields = ("title", "description", "file_url")
+    raw_id_fields = ("uploaded_by", "klass")
+
+
+# ---------- AI model registry ----------
+@admin.register(AiModel)
+class AiModelAdmin(admin.ModelAdmin):
+    list_display = ("id", "model_name", "endpoint_url", "version_identifier", "is_active", "strictness", "updated_at")
+    list_filter = ("is_active", "strictness")
+    search_fields = ("model_name", "version_identifier")
+    raw_id_fields = ("updated_by",)
+
+
+# ---------- System Log ----------
+@admin.register(SystemLog)
+class SystemLogAdmin(admin.ModelAdmin):
+    list_display = ("id", "admin", "action_description", "target_status", "timestamp")
+    list_filter = ("target_status", "timestamp")
+    search_fields = ("action_description",)
+    raw_id_fields = ("admin",)
