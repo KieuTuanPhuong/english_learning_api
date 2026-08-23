@@ -11,6 +11,7 @@ is_superuser) so it can log into /admin/.
 from datetime import date, timedelta
 from decimal import Decimal
 
+from django.core.management import call_command
 from django.core.management.base import BaseCommand
 from django.db import transaction
 from django.utils import timezone
@@ -20,11 +21,14 @@ from core.models import (
     Class,
     ClassStudent,
     DifficultyLevel,
+    DrillType,
     Exercise,
     ExerciseType,
     Feedback,
     LearningModule,
     LessonPlan,
+    PronunciationAttempt,
+    PronunciationDrill,
     Question,
     QuestionOption,
     StudentModuleProgress,
@@ -42,6 +46,80 @@ from core.models import (
 PASSWORD = "password123"
 
 
+def seed_pronunciation_drills(modules, teachers):
+    """Insert the demo pronunciation drills (docs/research/04-pronunciation-practice.md).
+
+    Practice loop only — deliberately NOT Exercise rows. Attempts are not
+    seeded: they need real uploaded audio (FileField + MEDIA_ROOT).
+
+    Module-level so a one-off backfill can reuse it without a full wipe;
+    `modules` and `teachers` are the lists built in Command.handle().
+    """
+    return PronunciationDrill.objects.bulk_create([
+        # Beginner — word
+        PronunciationDrill(target_text="water", drill_type=DrillType.WORD,
+            phoneme_hint="/ˈwɔː.tər/", difficulty_level=DifficultyLevel.BEGINNER,
+            module=modules[3], created_by=teachers[1]),
+        PronunciationDrill(target_text="comfortable", drill_type=DrillType.WORD,
+            phoneme_hint="/ˈkʌmf.tə.bəl/", difficulty_level=DifficultyLevel.BEGINNER,
+            module=modules[3], created_by=teachers[1]),
+        PronunciationDrill(target_text="Wednesday", drill_type=DrillType.WORD,
+            phoneme_hint="/ˈwenz.deɪ/", difficulty_level=DifficultyLevel.BEGINNER,
+            module=modules[3], created_by=teachers[1]),
+        # Beginner — minimal pair
+        PronunciationDrill(target_text="ship", contrast_text="sheep",
+            drill_type=DrillType.MINIMAL_PAIR, phoneme_hint="/ʃɪp/ vs /ʃiːp/",
+            difficulty_level=DifficultyLevel.BEGINNER,
+            module=modules[3], created_by=teachers[1]),
+        PronunciationDrill(target_text="bit", contrast_text="beat",
+            drill_type=DrillType.MINIMAL_PAIR, phoneme_hint="/bɪt/ vs /biːt/",
+            difficulty_level=DifficultyLevel.BEGINNER,
+            module=modules[3], created_by=teachers[1]),
+        # Beginner — sentence
+        PronunciationDrill(target_text="Could I have a coffee and a pastry, please?",
+            drill_type=DrillType.SENTENCE, phoneme_hint="Rising intonation on the question.",
+            difficulty_level=DifficultyLevel.BEGINNER,
+            module=modules[0], created_by=teachers[1]),
+        # Intermediate — word
+        PronunciationDrill(target_text="thorough", drill_type=DrillType.WORD,
+            phoneme_hint="/ˈθʌr.oʊ/", difficulty_level=DifficultyLevel.INTERMEDIATE,
+            module=modules[3], created_by=teachers[1]),
+        PronunciationDrill(target_text="entrepreneur", drill_type=DrillType.WORD,
+            phoneme_hint="/ˌɒn.trə.prəˈnɜːr/", difficulty_level=DifficultyLevel.INTERMEDIATE,
+            module=modules[3], created_by=teachers[1]),
+        # Intermediate — minimal pair
+        PronunciationDrill(target_text="think", contrast_text="sink",
+            drill_type=DrillType.MINIMAL_PAIR, phoneme_hint="/θɪŋk/ vs /sɪŋk/",
+            difficulty_level=DifficultyLevel.INTERMEDIATE,
+            module=modules[3], created_by=teachers[1]),
+        PronunciationDrill(target_text="vine", contrast_text="wine",
+            drill_type=DrillType.MINIMAL_PAIR, phoneme_hint="/vaɪn/ vs /waɪn/",
+            difficulty_level=DifficultyLevel.INTERMEDIATE,
+            module=modules[3], created_by=teachers[1]),
+        # Intermediate — sentence
+        PronunciationDrill(target_text="The research suggests a significant improvement.",
+            drill_type=DrillType.SENTENCE,
+            phoneme_hint="Stress: reSEARCH, sigNIFicant, imPROVEment.",
+            difficulty_level=DifficultyLevel.INTERMEDIATE,
+            module=modules[2], created_by=teachers[0]),
+        # Advanced — word
+        PronunciationDrill(target_text="phenomenon", drill_type=DrillType.WORD,
+            phoneme_hint="/fəˈnɒm.ɪ.nən/", difficulty_level=DifficultyLevel.ADVANCED,
+            module=modules[4], created_by=teachers[2]),
+        # Advanced — sentence
+        PronunciationDrill(target_text="Nevertheless, the evidence remains inconclusive.",
+            drill_type=DrillType.SENTENCE,
+            phoneme_hint="Pause after 'Nevertheless'; keep the linking /r/ in 'remains'.",
+            difficulty_level=DifficultyLevel.ADVANCED,
+            module=modules[4], created_by=teachers[2]),
+        PronunciationDrill(target_text="I'd like to talk about the advantages of public transport.",
+            drill_type=DrillType.SENTENCE,
+            phoneme_hint="IELTS Speaking Part 2 opener — steady pace, clear /d/ in \"I'd\".",
+            difficulty_level=DifficultyLevel.ADVANCED,
+            module=modules[4], created_by=teachers[2]),
+    ])
+
+
 class Command(BaseCommand):
     help = "Wipe and reseed the demo dataset."
 
@@ -52,6 +130,9 @@ class Command(BaseCommand):
         Feedback.objects.all().delete()
         Submission.objects.all().delete()
         Assignment.objects.all().delete()
+        # Drills survive the User wipe (created_by is SET_NULL) — wipe explicitly.
+        PronunciationAttempt.objects.all().delete()
+        PronunciationDrill.objects.all().delete()
         StudentModuleProgress.objects.all().delete()
         StudyMaterial.objects.all().delete()
         Exercise.objects.all().delete()
@@ -584,6 +665,10 @@ class Command(BaseCommand):
                 klass=classes[0]),
         ])
 
+        # ---------- Pronunciation drills (docs/research/04-pronunciation-practice.md) ----------
+        self.stdout.write("Seeding pronunciation drills…")
+        seed_pronunciation_drills(modules, teachers)
+
         # ---------- AI Models ----------
         self.stdout.write("Seeding AI models…")
         AiModel.objects.create(
@@ -593,6 +678,11 @@ class Command(BaseCommand):
             is_active=True,
             updated_by=admin,
         )
+
+        # ---------- Rubric templates (docs/research/02-scoring-rubrics.md) ----------
+        # Idempotent + additive: keyed on slug, not wiped above, safe to re-run.
+        self.stdout.write("Seeding rubric templates…")
+        call_command("seed_rubrics")
 
         self.stdout.write(self.style.SUCCESS("\n=== Seed complete ==="))
         self.stdout.write(
@@ -609,6 +699,7 @@ class Command(BaseCommand):
         self.stdout.write(f"  Feedback:         {Feedback.objects.count():>4}")
         self.stdout.write(f"  Progress:         {StudentModuleProgress.objects.count():>4}")
         self.stdout.write(f"  Study Materials:  {StudyMaterial.objects.count():>4}")
+        self.stdout.write(f"  Pron. Drills:     {PronunciationDrill.objects.count():>4}")
         self.stdout.write(f"  AI Models:        {AiModel.objects.count():>4}")
         self.stdout.write(f"  System Logs:      {SystemLog.objects.count():>4}")
         self.stdout.write("\nLogin (password for everyone): password123")

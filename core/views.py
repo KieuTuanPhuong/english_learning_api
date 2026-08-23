@@ -7,7 +7,9 @@ ownership rules mirror the original `require_roles` dependencies.
 import csv
 
 from django.contrib.auth import authenticate
-from django.db.models import Count, Q
+from django.core.exceptions import ImproperlyConfigured
+from django.core.files.storage import default_storage
+from django.db.models import Count, ProtectedError, Q
 from django.http import HttpResponse
 from django.utils import timezone
 # pyrefly: ignore [missing-import]
@@ -27,8 +29,10 @@ from rest_framework.exceptions import (
     PermissionDenied,
     ValidationError,
 )
+from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
+from rest_framework.throttling import UserRateThrottle
 from rest_framework.views import APIView
 # pyrefly: ignore [missing-import]
 from rest_framework_simplejwt.tokens import RefreshToken
@@ -42,24 +46,61 @@ from .models import (
     Feedback,
     LearningModule,
     LessonPlan,
+    MockTestTemplate,
+    PronunciationAttempt,
+    PronunciationDrill,
+    RubricTemplate,
+    ScoreConversionTable,
     StudentModuleProgress,
     Submission,
     SubmissionType,
     SubmissionStatus,
+    TestAttempt,
+    TestFormat,
+    TestSectionExercise,
     User,
     UserRole,
+    WritingAnnotation,
     StudyMaterial,
     AiModel,
     SystemLog,
 )
 from .permissions import (
     IsActiveUser, IsAdmin, IsStudent, IsTeacherOrAdmin,
-    can_view_submission_feedback,
+    can_view_attempt, can_view_submission_feedback, _teacher_may_annotate,
 )
+from . import mock_tests
 from asgiref.sync import async_to_sync
 from channels.layers import get_channel_layer
 
 from .ai import evaluate_submission
+from .ai.pronunciation import assess_attempt
+from .audio import (
+    MOCK_TEST_MAX_DURATION_SECONDS,
+    MOCK_TEST_MAX_UPLOAD_BYTES,
+    validate_upload,
+)
+
+
+class MediaUploadThrottle(UserRateThrottle):
+    """Upload cap for the shared audio endpoint. Generous enough for a Speaking
+    section (three parts, plus re-records) but not for a scripted flood."""
+
+    scope = "media_upload"
+
+    def get_rate(self):
+        return "60/hour"
+
+
+class PronunciationAttemptThrottle(UserRateThrottle):
+    """Attempt-create rate cap (research doc 04 N3 / risk 'attempt spam'):
+    30 recordings per hour per student. Self-contained rate so no global
+    DEFAULT_THROTTLE_RATES entry is needed."""
+
+    scope = "pronunciation_attempt"
+
+    def get_rate(self):
+        return "30/hour"
 
 def _broadcast_class(class_id, payload):
     """Best-effort real-time push to a class group. Never breaks the HTTP request."""
@@ -471,6 +512,24 @@ class ExerciseViewSet(
         qs = Submission.objects.filter(exercise=ex).order_by("id")
         return Response(s.SubmissionSerializer(qs, many=True).data)
 
+    @extend_schema(
+        summary="Resolved rubric template for this exercise (pin → type default → null)",
+        description=(
+            "Returns the RubricTemplate that grading this exercise's productive "
+            "submissions should use: the exercise's pinned template, else the "
+            "active default for its exercise_type, else 200 with a null body "
+            "(not 404) so the client falls back to holistic grading."
+        ),
+        responses={200: s.RubricTemplateSerializer},
+    )
+    @action(detail=True, methods=["get"], url_path="rubric")
+    def rubric(self, request, pk=None):
+        exercise = self.get_object()
+        template = RubricTemplate.resolve_for(exercise)
+        if template is None:
+            return Response(None)
+        return Response(s.RubricTemplateSerializer(template).data)
+
 
 # ============================================================ Submissions
 @extend_schema(tags=["submissions"])
@@ -516,8 +575,32 @@ class SubmissionViewSet(mixins.CreateModelMixin, viewsets.GenericViewSet):
         sub = self.get_object()
         if not can_view_submission_feedback(request.user, sub):
              raise PermissionDenied("Not permitted to view this feedback")
-        qs = Feedback.objects.filter(submission=sub).order_by("id")
+        qs = (
+            Feedback.objects.filter(submission=sub)
+            .prefetch_related("criterion_scores__criterion__template")
+            .order_by("id")
+        )
         return Response(s.FeedbackSerializer(qs, many=True).data)
+
+    @extend_schema(
+        summary="List inline annotations on a writing submission",
+        description=(
+            "Same read audience as feedback (can_view_submission_feedback): "
+            "owner student / class teacher / a teacher who reviewed it / admin. "
+            "Ordered by start_offset."
+        ),
+        responses={
+            200: s.WritingAnnotationSerializer(many=True),
+            403: OpenApiResponse(description="Not permitted to view this submission"),
+        },
+    )
+    @action(detail=True, methods=["get"], url_path="annotations")
+    def annotations(self, request, pk=None):
+        sub = self.get_object()
+        if not can_view_submission_feedback(request.user, sub):
+            raise PermissionDenied("Not permitted to view this submission")
+        qs = sub.annotations.all().order_by("start_offset", "end_offset", "id")
+        return Response(s.WritingAnnotationSerializer(qs, many=True).data)
 
     @extend_schema(
         summary="Teacher inbox: submissions across the teacher's own exercises",
@@ -685,6 +768,10 @@ class FeedbackViewSet(mixins.CreateModelMixin, viewsets.GenericViewSet):
         sub = feedback.submission
         sub.status = new_status
         sub.save(update_fields=["status"])
+
+        # If this submission belongs to a mock test's Writing/Speaking section,
+        # the score just became convertible into a band (no-op otherwise).
+        mock_tests.on_feedback_created(feedback)
 
         klass_id = getattr(sub.assignment, "klass_id", None)
         _broadcast_class(
@@ -1104,3 +1191,741 @@ class AdminHealthView(APIView):
             "server_time": timezone.now(),
         }
         return Response(s.HealthSerializer(payload).data)
+
+
+# ============================================================ Mock tests
+@extend_schema(tags=["mock-tests"])
+class TestFormatViewSet(viewsets.ModelViewSet):
+    """Exam-format registry (IELTS Academic, TOEIC L&R, ...). Readable by any
+    authenticated user so the catalog can badge templates; writable by admins
+    only — adding a format is data entry, never a migration."""
+
+    serializer_class = s.TestFormatSerializer
+
+    def get_queryset(self):
+        """Retired formats stay in the table — templates PROTECT them and old
+        reports still convert through their tables — but they leave the
+        catalogue. Admins keep seeing everything so a format can be brought
+        back without a shell."""
+        qs = TestFormat.objects.all().order_by("slug")
+        user = self.request.user
+        if user.is_authenticated and user.role == UserRole.ADMIN:
+            return qs
+        return qs.filter(is_active=True)
+
+    def get_permissions(self):
+        if self.action in ("list", "retrieve", "conversions"):
+            return _perms()
+        return _perms(IsAdmin)
+
+    @extend_schema(
+        summary="Read or replace a format's raw -> band/scaled conversion tables",
+        description=(
+            "GET returns every per-skill table for the format. PUT replaces one "
+            "table: body is {skill, mapping, source_note}. Official IELTS/TOEIC "
+            "tables are unpublished, so seeded mappings are approximations and "
+            "reports label scores 'estimated'."
+        ),
+        request=s.ScoreConversionTableSerializer,
+        responses={
+            200: s.ScoreConversionTableSerializer(many=True),
+            403: OpenApiResponse(description="Admin only"),
+        },
+    )
+    @action(detail=True, methods=["get", "put"], url_path="conversions")
+    def conversions(self, request, pk=None):
+        fmt = self.get_object()
+        if request.method == "GET":
+            qs = ScoreConversionTable.objects.filter(format=fmt).order_by("skill")
+            return Response(s.ScoreConversionTableSerializer(qs, many=True).data)
+
+        if request.user.role != UserRole.ADMIN:
+            raise PermissionDenied("Insufficient permissions")
+        ser = s.ScoreConversionTableSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        table, _ = ScoreConversionTable.objects.update_or_create(
+            format=fmt,
+            skill=ser.validated_data["skill"],
+            defaults={
+                "mapping": ser.validated_data["mapping"],
+                "source_note": ser.validated_data.get("source_note"),
+            },
+        )
+        return Response(s.ScoreConversionTableSerializer(table).data)
+
+
+@extend_schema(tags=["mock-tests"])
+class MockTestTemplateViewSet(viewsets.ModelViewSet):
+    """The platform's mock-test library: an ordered set of sections, each
+    wrapping existing Exercises.
+
+    Mock tests are app content, not classroom content — every authenticated
+    user reads the whole catalogue and any student can sit any test, with
+    admins curating the shelf. This mirrors StudyMaterialViewSet (RBAC rows
+    6-7): no publish gate, no per-teacher ownership scope.
+    """
+
+    serializer_class = s.MockTestTemplateSerializer
+
+    def get_queryset(self):
+        """A template whose format was retired drops out of the catalogue with
+        it — otherwise deactivating TOEIC would leave its papers on the shelf
+        with no way to sit them coherently. Admins still see everything."""
+        qs = (
+            MockTestTemplate.objects
+            .select_related("format")
+            .prefetch_related("sections__items__exercise")
+            .order_by("-created_at", "id")
+        )
+        user = self.request.user
+        if user.is_authenticated and user.role == UserRole.ADMIN:
+            return qs
+        return qs.filter(format__is_active=True)
+
+    def get_permissions(self):
+        if self.action in (
+            "create", "update", "partial_update", "destroy",
+            "duplicate", "import_template",
+        ):
+            return _perms(IsAdmin)      # curating the library is an admin job
+        if self.action == "attempts":
+            return _perms(IsStudent)
+        return _perms()                 # any active user browses and reads
+
+    def perform_create(self, serializer):
+        serializer.save(created_by=self.request.user)
+
+    def update(self, request, *args, **kwargs):
+        # Editing replaces the section list wholesale, which PROTECT refuses
+        # once anyone has sat the test — surface that as a 400, not a 500.
+        try:
+            return super().update(request, *args, **kwargs)
+        except ProtectedError:
+            raise ValidationError({
+                "detail": (
+                    "This mock test has already been attempted; its sections "
+                    "can no longer be changed. Add a new test instead."
+                ),
+                "code": "template_in_use",
+            })
+
+    def destroy(self, request, *args, **kwargs):
+        try:
+            return super().destroy(request, *args, **kwargs)
+        except ProtectedError:
+            raise ValidationError({
+                "detail": (
+                    "This mock test has attempts and cannot be deleted; "
+                    "removing it would destroy those students' score reports."
+                ),
+                "code": "template_in_use",
+            })
+
+    @extend_schema(
+        summary="Start (or resume) an attempt at this mock test",
+        description=(
+            "Creates a TestAttempt plus one not_started SectionAttempt per "
+            "section. Retakes are unlimited, but an unfinished attempt is "
+            "returned as-is instead of being duplicated — including its mode, "
+            "which resuming never changes.\n\n"
+            "`mode` is `exam` (sections in the template's order, the real "
+            "sitting) or `practice` (start with whichever section you like). "
+            "Defaults to `exam` when the body is omitted."
+        ),
+        request=s.TestAttemptCreateSerializer,
+        responses={
+            201: s.TestAttemptSerializer,
+            400: OpenApiResponse(description="Template has no sections"),
+        },
+    )
+    @action(detail=True, methods=["post"], url_path="attempts")
+    def attempts(self, request, pk=None):
+        template = self.get_object()
+        ser = s.TestAttemptCreateSerializer(data=request.data or {})
+        ser.is_valid(raise_exception=True)
+        try:
+            attempt = mock_tests.start_attempt(
+                template, request.user, mode=ser.validated_data["mode"],
+            )
+        except mock_tests.MockTestError as exc:
+            raise ValidationError({"detail": str(exc), "code": exc.code})
+        return Response(
+            s.TestAttemptSerializer(attempt).data, status=status.HTTP_201_CREATED
+        )
+
+    @extend_schema(
+        summary="Copy a template into a new, unattempted one",
+        description=(
+            "Sections and their items are copied; attempts are not. This is the "
+            "supported way to revise a test that students have already sat — "
+            "editing one in place is refused so their score reports keep "
+            "meaning what they said."
+        ),
+        request=None,
+        responses={201: s.MockTestTemplateSerializer},
+    )
+    @action(detail=True, methods=["post"], url_path="duplicate")
+    def duplicate(self, request, pk=None):
+        source = self.get_object()
+        copy = mock_tests.duplicate_template(source, request.user)
+        return Response(
+            s.MockTestTemplateSerializer(copy).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+    @extend_schema(
+        summary="Export a template as a portable JSON document",
+        description=(
+            "Exercises are inlined by content rather than by id, so the document "
+            "can be imported into another environment where those ids mean "
+            "nothing. Answer keys are included — this is an admin export, not "
+            "anything a student may read."
+        ),
+        responses={200: s.MockTestDocumentSerializer},
+    )
+    @action(detail=True, methods=["get"], url_path="export")
+    def export(self, request, pk=None):
+        return Response(mock_tests.export_template(self.get_object()))
+
+    @extend_schema(
+        summary="Import one or more exported templates",
+        description=(
+            "Body is a single export document or a list of them — the bulk path. "
+            "Each document creates its own exercises, so an import never "
+            "re-points at content another test already owns."
+        ),
+        request=s.MockTestDocumentSerializer,
+        responses={201: s.MockTestTemplateSerializer(many=True)},
+    )
+    @action(detail=False, methods=["post"], url_path="import", url_name="import")
+    def import_template(self, request):
+        documents = request.data if isinstance(request.data, list) else [request.data]
+        ser = s.MockTestDocumentSerializer(data=documents, many=True)
+        ser.is_valid(raise_exception=True)
+        try:
+            created = mock_tests.import_templates(ser.validated_data, request.user)
+        except mock_tests.MockTestError as exc:
+            raise ValidationError({"detail": str(exc), "code": exc.code})
+        return Response(
+            s.MockTestTemplateSerializer(created, many=True).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+
+@extend_schema(tags=["mock-tests"])
+class TestAttemptViewSet(
+    mixins.RetrieveModelMixin, viewsets.GenericViewSet
+):
+    """A student's sitting of a mock test. All timing is server-authoritative
+    (core/mock_tests.py): the client only reads `expires_at` and `server_time`."""
+
+    serializer_class = s.TestAttemptSerializer
+
+    def get_queryset(self):
+        return (
+            TestAttempt.objects
+            .select_related("template__format", "student")
+            .prefetch_related(
+                "sections__section__items__exercise__questions__options"
+            )
+            .order_by("-started_at", "-id")
+        )
+
+    def get_permissions(self):
+        if self.action in ("start", "answers", "submit", "advance"):
+            return _perms(IsStudent)
+        return _perms()
+
+    def get_object(self):
+        attempt = super().get_object()
+        if not can_view_attempt(self.request.user, attempt):
+            raise PermissionDenied("Not permitted to view this attempt")
+        return attempt
+
+    def _own_attempt(self):
+        """Write actions are the sitting student's alone — a class teacher may
+        read an attempt but never touch its clock or answers."""
+        attempt = super().get_object()
+        if attempt.student_id != self.request.user.id:
+            raise PermissionDenied("Not your attempt")
+        return attempt
+
+    @staticmethod
+    def _handle(exc: "mock_tests.MockTestError"):
+        """Map a domain error onto HTTP. `section_expired` is a 409 because the
+        client treats it as a state transition (lock the UI), not a bad request."""
+        if isinstance(exc, mock_tests.SectionExpired):
+            return Response(
+                {"detail": str(exc), "code": exc.code},
+                status=status.HTTP_409_CONFLICT,
+            )
+        if exc.code == "not_found":
+            raise NotFound(str(exc))
+        raise ValidationError({"detail": str(exc), "code": exc.code})
+
+    @extend_schema(
+        summary="List the current student's own mock-test attempts",
+        responses={200: s.TestAttemptListSerializer(many=True)},
+    )
+    @action(detail=False, methods=["get"], url_path="me")
+    def me(self, request):
+        qs = (
+            TestAttempt.objects
+            .filter(student=request.user)
+            .select_related("template__format")
+            # Prefetched, not annotated: the serializer counts in Python from
+            # one extra query rather than adding two aggregate subqueries.
+            .prefetch_related("sections")
+            .order_by("-started_at", "-id")
+        )
+        return Response(s.TestAttemptListSerializer(qs, many=True).data)
+
+    @extend_schema(
+        summary="Start a section's server clock",
+        description=(
+            "Sets started_at and expires_at (duration + 30s grace). Sections "
+            "must be taken in order, one at a time. Idempotent while the "
+            "section is already running."
+        ),
+        request=None,
+        responses={200: s.SectionAttemptSerializer},
+    )
+    @action(
+        detail=True, methods=["post"],
+        url_path=r"sections/(?P<section_attempt_id>[0-9]+)/start",
+    )
+    def start(self, request, pk=None, section_attempt_id=None):
+        attempt = self._own_attempt()
+        try:
+            section_attempt = mock_tests.start_section(attempt, section_attempt_id)
+        except mock_tests.MockTestError as exc:
+            return self._handle(exc)
+        return Response(s.SectionAttemptSerializer(section_attempt).data)
+
+    @extend_schema(
+        summary="Autosave the section's draft answers",
+        description=(
+            "Replaces the whole draft envelope in one row UPDATE. Returns 409 "
+            "with code `section_expired` once the clock has run out — the "
+            "client then locks the UI and offers only Submit."
+        ),
+        request=s.SectionDraftSerializer,
+        responses={
+            200: s.SectionAttemptSerializer,
+            409: OpenApiResponse(description="Section expired (code: section_expired)"),
+        },
+    )
+    @action(
+        detail=True, methods=["patch"],
+        url_path=r"sections/(?P<section_attempt_id>[0-9]+)/answers",
+    )
+    def answers(self, request, pk=None, section_attempt_id=None):
+        attempt = self._own_attempt()
+        ser = s.SectionDraftSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        try:
+            section_attempt = mock_tests.autosave(
+                attempt, section_attempt_id, ser.validated_data
+            )
+        except mock_tests.MockTestError as exc:
+            return self._handle(exc)
+        return Response(s.SectionAttemptSerializer(section_attempt).data)
+
+    @extend_schema(
+        summary="Close the current part of a sequential section",
+        description=(
+            "Listening recordings and Speaking interview parts run one at a "
+            "time with no going back. This closes the part in hand and opens "
+            "the next; it is idempotent, so a double tap cannot skip one. "
+            "Sections whose parts are all open (Reading, Writing) reject it."
+        ),
+        request=s.SectionAdvanceSerializer,
+        responses={200: s.SectionAttemptSerializer},
+    )
+    @action(
+        detail=True, methods=["post"],
+        url_path=r"sections/(?P<section_attempt_id>[0-9]+)/advance",
+    )
+    def advance(self, request, pk=None, section_attempt_id=None):
+        attempt = self._own_attempt()
+        ser = s.SectionAdvanceSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        try:
+            section_attempt = mock_tests.advance_item(
+                attempt, section_attempt_id, ser.validated_data["exercise_id"]
+            )
+        except mock_tests.MockTestError as exc:
+            return self._handle(exc)
+        return Response(s.SectionAttemptSerializer(section_attempt).data)
+
+    @extend_schema(
+        summary="Submit a section",
+        description=(
+            "Creates one ordinary Submission per exercise in the section, "
+            "auto-grades receptive ones, and converts the raw count into a "
+            "band/scaled score. Accepted after expiry too, but then it grades "
+            "the last draft the server accepted rather than the request body."
+        ),
+        request=s.SectionSubmitSerializer,
+        responses={200: s.SectionAttemptSerializer},
+    )
+    @action(
+        detail=True, methods=["post"],
+        url_path=r"sections/(?P<section_attempt_id>[0-9]+)/submit",
+    )
+    def submit(self, request, pk=None, section_attempt_id=None):
+        attempt = self._own_attempt()
+        ser = s.SectionSubmitSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        try:
+            section_attempt = mock_tests.submit_section(
+                attempt,
+                section_attempt_id,
+                draft=ser.validated_data.get("draft"),
+                recordings=ser.validated_data.get("recordings"),
+            )
+        except mock_tests.MockTestError as exc:
+            return self._handle(exc)
+        return Response(s.SectionAttemptSerializer(section_attempt).data)
+
+    @extend_schema(
+        summary="Score report for an attempt (owner student / their teacher / admin)",
+        description=(
+            "`partial` stays true while any section lacks a converted score — "
+            "Listening/Reading land immediately, Writing/Speaking after "
+            "teacher or AI grading. Scores are estimates: see `estimated`."
+        ),
+        responses={200: s.TestAttemptReportSerializer},
+    )
+    @action(detail=True, methods=["get"], url_path="report")
+    def report(self, request, pk=None):
+        attempt = self.get_object()
+        return Response(
+            s.TestAttemptReportSerializer(mock_tests.build_report(attempt)).data
+        )
+
+
+# ============================================================ Rubrics
+@extend_schema(tags=["rubrics"])
+class RubricTemplateViewSet(viewsets.ReadOnlyModelViewSet):
+    """Read-only rubric registry (docs/research/02-scoring-rubrics.md §4.4).
+    List shows active templates only; retrieve includes inactive ones so
+    historic grades still render against the exact rubric used (NFR2). Readable
+    by any authenticated active user — students need the wording for their own
+    breakdowns. MVP content is managed via seed_rubrics + Django admin."""
+
+    serializer_class = s.RubricTemplateSerializer
+
+    def get_queryset(self):
+        qs = (
+            RubricTemplate.objects
+            .prefetch_related("criteria__band_descriptors")
+            .order_by("id")
+        )
+        if self.action == "list":
+            return qs.filter(is_active=True)
+        return qs
+
+    def get_permissions(self):
+        return _perms()
+
+
+# ============================================================ Writing annotations
+@extend_schema(tags=["annotations"])
+class WritingAnnotationViewSet(
+    mixins.CreateModelMixin, mixins.UpdateModelMixin,
+    mixins.DestroyModelMixin, viewsets.GenericViewSet,
+):
+    """Inline teacher annotations on a writing submission
+    (docs/research/03-writing-annotations.md §4.4). Nested read lives on
+    SubmissionViewSet.annotations; this viewset owns the writes."""
+
+    serializer_class = s.WritingAnnotationSerializer
+    # Class attribute only so the router/OpenAPI generator can resolve the model
+    # (get_queryset below needs request.user and is the real runtime source).
+    queryset = WritingAnnotation.objects.all()
+
+    def get_queryset(self):
+        # Same leak-proof scoping idea as FeedbackViewSet.get_queryset.
+        qs = WritingAnnotation.objects.all().order_by("id")
+        user = self.request.user
+        if user.role == UserRole.ADMIN:
+            return qs
+        if user.role == UserRole.TEACHER:
+            return qs.filter(
+                Q(author=user) | Q(submission__assignment__klass__teacher=user)
+            ).distinct()
+        return qs.filter(submission__student=user)  # students: acknowledge only
+
+    def get_permissions(self):
+        if self.action == "acknowledge":
+            return _perms(IsStudent)
+        return _perms(IsTeacherOrAdmin)
+
+    def perform_create(self, serializer):
+        submission = serializer.validated_data["submission"]
+        if not _teacher_may_annotate(self.request.user, submission):
+            raise PermissionDenied("Not your class's submission")
+        serializer.save(author=self.request.user)
+
+    def perform_update(self, serializer):
+        obj = serializer.instance
+        user = self.request.user
+        if user.role != UserRole.ADMIN and obj.author_id != user.id:
+            raise PermissionDenied("Not your annotation")
+        serializer.save()
+
+    def perform_destroy(self, instance):
+        user = self.request.user
+        if user.role != UserRole.ADMIN and instance.author_id != user.id:
+            raise PermissionDenied("Not your annotation")
+        instance.delete()
+
+    @extend_schema(
+        summary="Acknowledge an annotation (submission's student only) — Phase 2",
+        request=None,
+        responses={200: s.WritingAnnotationSerializer},
+    )
+    @action(detail=True, methods=["post"], url_path="acknowledge")
+    def acknowledge(self, request, pk=None):
+        annotation = self.get_object()
+        if annotation.submission.student_id != request.user.id:
+            raise PermissionDenied("Only the submission's student may acknowledge.")
+        annotation.is_acknowledged = True
+        annotation.save(update_fields=["is_acknowledged"])
+        return Response(s.WritingAnnotationSerializer(annotation).data)
+
+
+# ============================================================ Media uploads
+@extend_schema(tags=["media"])
+class AudioUploadView(APIView):
+    """Store one audio file and return the URL to reference it by.
+
+    Two callers, one endpoint:
+
+    * an admin attaching a recording to a listening ``Exercise``
+      (``audio_prompt_url``), and
+    * a student's Speaking answer during a mock test.
+
+    The second is why this exists. Speaking answers used to travel as base64
+    data URLs inside the section-submit body; an IELTS Speaking section is three
+    parts of up to five minutes each, which is tens of megabytes of JSON in one
+    request and the same again in the row. Uploading each clip on its own and
+    submitting URLs keeps both bounded.
+
+    Passing ``attempt_id`` + ``exercise_id`` applies that part's
+    ``max_record_seconds`` on top of the global cap, so an IELTS Part 2 long
+    turn is held to its real two minutes rather than the endpoint's six.
+    """
+
+    permission_classes = _BASE
+    parser_classes = [MultiPartParser, FormParser]
+    throttle_classes = [MediaUploadThrottle]
+
+    @extend_schema(
+        summary="Upload an audio file and get back its URL",
+        request={"multipart/form-data": {
+            "type": "object",
+            "properties": {
+                "audio": {"type": "string", "format": "binary"},
+                "attempt_id": {"type": "integer"},
+                "exercise_id": {"type": "integer"},
+            },
+            "required": ["audio"],
+        }},
+        responses={
+            201: inline_serializer(
+                name="AudioUploadResponse",
+                fields={"url": drf_serializers.CharField()},
+            ),
+            400: OpenApiResponse(description="Missing, oversized, or too-long audio"),
+        },
+    )
+    def post(self, request):
+        upload = request.FILES.get("audio")
+        if upload is None:
+            raise ValidationError({"audio": "An audio file is required."})
+
+        max_seconds = MOCK_TEST_MAX_DURATION_SECONDS
+        item = self._section_item(request)
+        if item is not None and item.max_record_seconds:
+            max_seconds = item.max_record_seconds
+
+        validate_upload(
+            upload,
+            max_bytes=MOCK_TEST_MAX_UPLOAD_BYTES,
+            max_seconds=max_seconds,
+        )
+        stored = default_storage.save(
+            f"mock-tests/{timezone.now():%Y/%m}/{upload.name}", upload
+        )
+        return Response(
+            {"url": default_storage.url(stored)}, status=status.HTTP_201_CREATED
+        )
+
+    @staticmethod
+    def _section_item(request):
+        """The TestSectionExercise this clip answers, when the caller names one.
+
+        Scoped to the requesting student's own live attempt: the per-part limit
+        is only meaningful there, and looking it up any other way would let one
+        student probe another's attempt for section structure.
+        """
+        attempt_id = request.data.get("attempt_id")
+        exercise_id = request.data.get("exercise_id")
+        if not attempt_id or not exercise_id:
+            return None
+        return TestSectionExercise.objects.filter(
+            exercise_id=exercise_id,
+            section__attempts__attempt_id=attempt_id,
+            section__attempts__attempt__student=request.user,
+        ).first()
+
+
+# ============================================================ Pronunciation practice
+@extend_schema(tags=["pronunciation"])
+class PronunciationDrillViewSet(viewsets.ModelViewSet):
+    """Pronunciation drills (docs/research/04-pronunciation-practice.md §4.2).
+    Any authenticated user browses; teachers/admins author (creator-scoped edit).
+    The nested `attempts` action is the record → score → retry loop."""
+
+    serializer_class = s.PronunciationDrillSerializer
+    queryset = PronunciationDrill.objects.all().order_by("difficulty_level", "id")
+
+    def get_queryset(self):
+        qs = PronunciationDrill.objects.all().order_by("difficulty_level", "id")
+        if self.action != "list":
+            return qs
+        params = self.request.query_params
+        drill_type = params.get("drill_type")
+        difficulty = params.get("difficulty")
+        module_id = params.get("module_id")
+        if drill_type:
+            qs = qs.filter(drill_type=drill_type)
+        if difficulty:
+            qs = qs.filter(difficulty_level=difficulty)
+        if module_id:
+            qs = qs.filter(module_id=module_id)
+        return qs
+
+    def get_permissions(self):
+        if self.action in ("create", "update", "partial_update", "destroy"):
+            return _perms(IsTeacherOrAdmin)
+        return _perms()
+
+    def get_throttles(self):
+        # Only the recording POST is rate-capped; browsing history is not.
+        if self.action == "attempts" and self.request.method == "POST":
+            return [PronunciationAttemptThrottle()]
+        return super().get_throttles()
+
+    def perform_create(self, serializer):
+        serializer.save(created_by=self.request.user)
+
+    def _require_owner(self, drill):
+        user = self.request.user
+        if user.role == UserRole.TEACHER and drill.created_by_id != user.id:
+            raise PermissionDenied("Not your drill")
+
+    def update(self, request, *args, **kwargs):
+        self._require_owner(self.get_object())
+        return super().update(request, *args, **kwargs)
+
+    def destroy(self, request, *args, **kwargs):
+        self._require_owner(self.get_object())
+        return super().destroy(request, *args, **kwargs)
+
+    @extend_schema(
+        summary="List own attempts (GET) or record + score a new one (POST)",
+        description=(
+            "GET returns the current student's attempt history for this drill "
+            "(retry loop). POST is multipart/form-data with field `audio`: the "
+            "server validates size/type, stores the file, runs pronunciation "
+            "assessment synchronously, and returns the scored attempt (201)."
+        ),
+        request={
+            "multipart/form-data": s.PronunciationAttemptCreateSerializer,
+        },
+        responses={
+            200: s.PronunciationAttemptSerializer(many=True),
+            201: s.PronunciationAttemptSerializer,
+        },
+    )
+    @action(
+        detail=True, methods=["get", "post"], url_path="attempts",
+        parser_classes=[MultiPartParser, FormParser],
+    )
+    def attempts(self, request, pk=None):
+        drill = self.get_object()
+        if request.method == "GET":
+            qs = PronunciationAttempt.objects.filter(
+                drill=drill, student=request.user
+            ).order_by("-created_at", "-id")
+            return Response(
+                s.PronunciationAttemptSerializer(
+                    qs, many=True, context={"request": request}
+                ).data
+            )
+
+        # POST — students only record attempts.
+        if request.user.role != UserRole.STUDENT:
+            raise PermissionDenied("Only students record attempts.")
+        upload = request.FILES.get("audio")
+        if upload is None:
+            raise ValidationError({"audio": "An audio file is required."})
+        validate_upload(upload)  # size / type / duration caps
+        attempt = PronunciationAttempt.objects.create(
+            drill=drill, student=request.user, audio_file=upload,
+        )
+        try:
+            assess_attempt(attempt)
+        except (RuntimeError, ValueError, ImproperlyConfigured) as exc:
+            # Loud failure when the real engine is misconfigured; the attempt row
+            # survives (nullable scores) so a fixed deploy can re-score it.
+            raise ValidationError(str(exc))
+        return Response(
+            s.PronunciationAttemptSerializer(
+                attempt, context={"request": request}
+            ).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+
+@extend_schema(tags=["pronunciation"])
+class PronunciationAttemptViewSet(viewsets.GenericViewSet):
+    """Cross-drill attempt history for the current student. Attempts are always
+    scoped to the requesting student (N2: read only your own)."""
+
+    serializer_class = s.PronunciationAttemptSerializer
+
+    def get_queryset(self):
+        return (
+            PronunciationAttempt.objects
+            .filter(student=self.request.user)
+            .order_by("-created_at", "-id")
+        )
+
+    def get_permissions(self):
+        return _perms(IsStudent)
+
+    @extend_schema(
+        summary="The current student's attempts across all drills",
+        parameters=[
+            OpenApiParameter(
+                "drill_id", OpenApiTypes.INT, OpenApiParameter.QUERY,
+                description="Filter to a single drill",
+            ),
+        ],
+        responses={200: s.PronunciationAttemptSerializer(many=True)},
+    )
+    @action(detail=False, methods=["get"], url_path="me")
+    def me(self, request):
+        qs = self.get_queryset()
+        drill_id = request.query_params.get("drill_id")
+        if drill_id:
+            qs = qs.filter(drill_id=drill_id)
+        return Response(
+            s.PronunciationAttemptSerializer(
+                qs, many=True, context={"request": request}
+            ).data
+        )
