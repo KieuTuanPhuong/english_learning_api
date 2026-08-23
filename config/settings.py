@@ -129,6 +129,11 @@ SPECTACULAR_SETTINGS = {
     # component. Name that shared set explicitly to silence the rename warning.
     "ENUM_NAME_OVERRIDES": {
         "SkillTypeEnum": "core.models.ExerciseType.choices",
+        # Mock tests add two more `status` fields; name them explicitly so the
+        # generated client gets AttemptStatusEnum/SectionStatusEnum instead of
+        # another hash-suffixed StatusXxxEnum.
+        "AttemptStatusEnum": "core.models.AttemptStatus.choices",
+        "SectionStatusEnum": "core.models.SectionStatus.choices",
     },
     # Bearer JWT — show the Authorize button in Swagger UI.
     "SECURITY": [{"jwtAuth": []}],
@@ -147,6 +152,10 @@ SPECTACULAR_SETTINGS = {
         {"name": "reports", "description": "Analytical grade-report export (CSV; PDF deferred)"},
         {"name": "ai", "description": "Admin AI ML configuration and automated grading actions"},
         {"name": "admin", "description": "Platform management, health status, activity feed"},
+        {"name": "mock-tests", "description": "Timed IELTS/TOEIC-style mock tests: formats, templates, attempts, reports"},
+        {"name": "rubrics", "description": "Criteria x bands scoring matrices for Writing/Speaking review"},
+        {"name": "annotations", "description": "Inline span-anchored teacher notes on writing submissions"},
+        {"name": "pronunciation", "description": "Self-serve pronunciation drills: record, score, retry"},
     ],
 }
 
@@ -175,8 +184,21 @@ USE_TZ = True
 STATIC_URL = "static/"
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
+# Media (real file uploads) — docs/research/04-pronunciation-practice.md §5 phase 0.
+# The platform's first FileField (PronunciationAttempt.audio_file) lands here.
+# Local disk for MVP; flip STORAGES["default"] to S3 (django-storages) later with
+# no model change. MEDIA_URL is served by an authenticated file view in dev/MVP
+# (see config/urls.py) and by presigned S3 GETs in the S3 phase.
+MEDIA_ROOT = os.getenv("MEDIA_ROOT") or (BASE_DIR / "media")
+MEDIA_URL = "/media/"
+
 # AI grading integration settings
 AI_BACKEND = os.getenv("AI_BACKEND", "mock").lower()
+
+# Pronunciation-assessment engine switch (sibling of AI_BACKEND). "mock"
+# (default, deterministic/offline) or "azure" (real; requires ffmpeg + Azure
+# env keys) — docs/research/04-pronunciation-practice.md §4.4.
+PRONUNCIATION_BACKEND = os.getenv("PRONUNCIATION_BACKEND", "mock").lower()
 
 # Reports — PDF export is deferred behind reportlab; CSV is always available.
 REPORTS_PDF_ENABLED = os.getenv("REPORTS_PDF_ENABLED", "false").lower() == "true"

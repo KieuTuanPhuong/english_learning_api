@@ -63,3 +63,44 @@ def can_view_submission_feedback(user, submission) -> bool:
         if submission.feedback.filter(reviewer_id=user.id).exists():
             return True
     return False
+
+
+def _teacher_may_annotate(user, submission) -> bool:
+    """True if `user` may create inline annotations on `submission`.
+
+    Admin → always. Teacher → yes if they own the submission's class
+    (``assignment.klass.teacher``), or — for self-practice submissions where
+    ``assignment`` is null — if they own the exercise (``exercise.created_by``
+    with the ``exercise.module.created_by`` legacy fallback, the same ownership
+    rule the submissions inbox uses, ``SubmissionViewSet.inbox``).
+    """
+    if user.role == UserRole.ADMIN:
+        return True
+    if user.role != UserRole.TEACHER:
+        return False
+    assignment = submission.assignment
+    if assignment and assignment.klass_id and assignment.klass.teacher_id == user.id:
+        return True
+    exercise = submission.exercise
+    if exercise.created_by_id == user.id:
+        return True
+    module = exercise.module
+    return bool(module and module.created_by_id == user.id)
+
+
+def can_view_attempt(user, attempt) -> bool:
+    """True if `user` may read a mock-test attempt and its score report.
+
+    Mirrors `can_view_submission_feedback`: the student who sat it, a teacher
+    who teaches that student (mock attempts are self-initiated, so there is no
+    assignment to hang class scope on), or any admin.
+    """
+    if user.role == UserRole.ADMIN:
+        return True
+    if attempt.student_id == user.id:
+        return True
+    if user.role == UserRole.TEACHER:
+        return attempt.student.class_memberships.filter(
+            klass__teacher_id=user.id
+        ).exists()
+    return False

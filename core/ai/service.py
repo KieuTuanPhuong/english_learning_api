@@ -60,6 +60,13 @@ def evaluate_submission(submission) -> Feedback:
     if hasattr(submission, "status"):
         submission.status = SubmissionStatus.AI_GRADED
         submission.save(update_fields=["status"])
+
+    # Mock-test Writing/Speaking sections convert this score into a band.
+    # Imported lazily: mock_tests consumes the AI layer's output, it is not a
+    # dependency of it. No-op for ordinary submissions.
+    from ..mock_tests import on_feedback_created
+
+    on_feedback_created(fb)
     return fb
 
 
