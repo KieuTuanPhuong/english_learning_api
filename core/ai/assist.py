@@ -142,6 +142,17 @@ def _receptive_breakdown(submission) -> list[dict]:
     return rows
 
 
+def _speaking_transcript(submission) -> str | None:
+    """Transcript for a speaking submission, or ``None`` on the mock backend.
+    Cached on the newest ``AiInsight`` payload if we already transcribed."""
+    prior = submission.ai_insights.filter(payload__has_key="transcript").first()
+    if prior is not None:
+        return prior.payload.get("transcript")
+    if get_assist_backend().name != "gemini":
+        return None
+    return gemini.transcribe(submission.audio_recording_url)
+
+
 def build_context(submission) -> dict:
     """Everything the model needs about one submission, as plain data."""
     exercise = submission.exercise
@@ -158,9 +169,13 @@ def build_context(submission) -> dict:
         },
         "auto_score": str(submission.auto_score) if submission.auto_score is not None else None,
     }
-    if submission.submission_type in (SubmissionType.WRITING, SubmissionType.SPEAKING):
+    if submission.submission_type == SubmissionType.WRITING:
         ctx["writing_text"] = _clip(submission.writing_text)
+    elif submission.submission_type == SubmissionType.SPEAKING:
         ctx["audio_recording_url"] = submission.audio_recording_url
+        # Reuse the newest AI feedback transcript when one exists ("[AI ·"
+        # rows carry it in comments only, so look at the payload we control).
+        ctx["transcript"] = _speaking_transcript(submission)
     else:
         ctx["questions"] = _receptive_breakdown(submission)
 
@@ -306,6 +321,9 @@ _MISTAKES_SYSTEM = textwrap.dedent("""
     English a learner can understand. For receptive tasks (reading, listening,
     quiz) use the per-question data: explain WHY the correct answer is right
     and why the student's choice is wrong, referring to the passage or prompt.
+    For speaking tasks a verbatim "transcript" is supplied: treat it like
+    writing but also point out spoken-language issues (fillers, unfinished
+    sentences, word stress) where the transcript shows them.
     For writing tasks, find grammar, vocabulary, spelling, punctuation,
     coherence and task-response problems; quote the exact words in "location",
     give the corrected form and a one-sentence rule or tip. Order mistakes by
@@ -381,15 +399,20 @@ def explain_mistakes(submission) -> dict:
     """Explain the mistakes in ``submission``. Speaking submissions have no
     transcript to analyse yet, so they are rejected with ``ValueError``."""
     if submission.submission_type == SubmissionType.SPEAKING:
-        raise ValueError(
-            "Mistake explanation needs text; speaking submissions are not "
-            "supported until transcription is available."
-        )
+        if not submission.audio_recording_url:
+            raise ValueError("This speaking submission has no recording to analyse.")
+        if get_assist_backend().name != "gemini":
+            raise ValueError(
+                "Mistake explanation for speaking needs the Gemini backend "
+                "(AI_ASSIST_BACKEND=gemini) to transcribe the recording."
+            )
     if submission.submission_type == SubmissionType.WRITING and not (submission.writing_text or "").strip():
         raise ValueError("This writing submission has no text to analyse.")
-    if submission.submission_type not in (SubmissionType.WRITING,) and not submission.answers:
+    if submission.submission_type not in (SubmissionType.WRITING, SubmissionType.SPEAKING) and not submission.answers:
         raise ValueError("This submission has no answers to analyse.")
     ctx = build_context(submission)
     result = get_assist_backend().explain_mistakes(ctx)
     result["engine"] = engine_label()
+    if ctx.get("transcript"):
+        result["transcript"] = ctx["transcript"]
     return result

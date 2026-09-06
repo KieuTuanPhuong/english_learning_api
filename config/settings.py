@@ -194,7 +194,9 @@ DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 MEDIA_ROOT = os.getenv("MEDIA_ROOT") or (BASE_DIR / "media")
 MEDIA_URL = "/media/"
 
-# AI grading integration settings
+# AI grading integration settings: "mock" (deterministic), "gemini" (live via
+# GEMINI_API_KEY — writing rubric grading + speaking transcription/scoring),
+# "real" (legacy stub, raises).
 AI_BACKEND = os.getenv("AI_BACKEND", "mock").lower()
 
 # AI coaching assistants (teacher-feedback review, student mistake explanation;
@@ -207,8 +209,9 @@ AI_ASSIST_BACKEND = (
 ).lower()
 
 # Pronunciation-assessment engine switch (sibling of AI_BACKEND). "mock"
-# (default, deterministic/offline) or "azure" (real; requires ffmpeg + Azure
-# env keys) — docs/research/04-pronunciation-practice.md §4.4.
+# (default, deterministic/offline), "gemini" (live audio assessment via
+# GEMINI_API_KEY, no ffmpeg) or "azure" (stub; requires ffmpeg + Azure keys)
+# — docs/research/04-pronunciation-practice.md §4.4.
 PRONUNCIATION_BACKEND = os.getenv("PRONUNCIATION_BACKEND", "mock").lower()
 
 # The test suite must never spend Gemini quota or depend on the network: force

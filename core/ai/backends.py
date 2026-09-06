@@ -1,9 +1,12 @@
 """AI grading backends.
 
 ============================== STUB vs REAL ==============================
-MockBackend  -> DETERMINISTIC, no network. Default everywhere. Scores derive
-                from text length + a keyword rubric so tests/seed are stable.
-RealBackend  -> STUBBED. Documents exactly where the OpenAI Whisper STT and
+MockBackend   -> DETERMINISTIC, no network. Default everywhere. Scores derive
+                 from text length + a keyword rubric so tests/seed are stable.
+GeminiBackend -> LIVE. ``AI_BACKEND=gemini`` + ``GEMINI_API_KEY``. Writing is
+                 rubric-graded from text; Speaking is transcribed AND scored in
+                 one multimodal call (audio inline) — no Whisper needed.
+RealBackend   -> STUBBED. Documents exactly where the OpenAI Whisper STT and
                 LLM rubric calls go. Raises until wired, so a misconfigured
                 deploy fails loudly instead of silently mis-grading.
 =========================================================================
@@ -11,10 +14,13 @@ RealBackend  -> STUBBED. Documents exactly where the OpenAI Whisper STT and
 
 from __future__ import annotations
 
+import json
+import textwrap
 from decimal import Decimal, ROUND_HALF_UP
 
 # pyrefly: ignore [missing-import]
-from ..models import GradingStrictness
+from ..models import GradingStrictness, RubricTemplate
+from . import gemini
 
 # Strictness -> multiplier applied to the deterministic mock score.
 _STRICTNESS_FACTOR = {
@@ -122,3 +128,146 @@ class RealBackend(BaseAIBackend):
             "RealBackend.transcribe_and_score_speaking is a stub. Set "
             "AI_BACKEND=mock, or implement Whisper STT + LLM scoring."
         )
+
+
+# ============================== Gemini (live) ==============================
+_GRADE_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "score": {"type": "NUMBER"},
+        "comments": {"type": "STRING"},
+        "criteria": {
+            "type": "ARRAY",
+            "items": {
+                "type": "OBJECT",
+                "properties": {
+                    "code": {"type": "STRING"},
+                    "band": {"type": "NUMBER"},
+                    "note": {"type": "STRING"},
+                },
+                "required": ["code", "band", "note"],
+            },
+        },
+    },
+    "required": ["score", "comments", "criteria"],
+}
+
+_SPEAK_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "transcript": {"type": "STRING"},
+        **_GRADE_SCHEMA["properties"],
+    },
+    "required": ["transcript", "score", "comments", "criteria"],
+}
+
+_STRICTNESS_TEXT = {
+    GradingStrictness.LENIENT: "lenient (reward effort; round borderline bands up)",
+    GradingStrictness.STANDARD: "standard (official examiner calibration)",
+    GradingStrictness.STRICT: "strict (round borderline bands down; penalise every error)",
+}
+
+_GRADER_SYSTEM = textwrap.dedent("""
+    You are a certified English examiner. Grade the student's response to the
+    exercise. Return "score" as a percentage 0-100 of the maximum achievable
+    quality for the task (IELTS band 9 == 100, band 4.5 == 50; TOEIC/CEFR
+    equivalents scale the same way). If a rubric with criteria is supplied,
+    assess each criterion on the rubric's native scale in "criteria" (use the
+    criterion "code"), and make "score" consistent with them; otherwise return
+    an empty "criteria" list. "comments" is feedback addressed to the student:
+    2 concrete strengths, the 2-3 most important problems with quoted
+    examples and corrections, and one next step — at most ~200 words, plain
+    English suited to the student's level. Apply the grading strictness given.
+    Never invent content that is not in the response.
+""").strip()
+
+_SPEAKING_SYSTEM = _GRADER_SYSTEM + textwrap.dedent("""
+
+    The response is an AUDIO recording. First transcribe it verbatim into
+    "transcript" (keep hesitations like "um" and self-corrections; write
+    "[inaudible]" where needed). Then grade fluency & coherence, lexical
+    resource, grammatical range & accuracy, and pronunciation from what you
+    hear, and include pronunciation observations in "comments". If the audio is
+    silent or unrelated, transcribe what is there, score accordingly and say so.
+""")
+
+
+class GeminiBackend(BaseAIBackend):
+    """Live grading through Gemini (``core/ai/gemini.py``)."""
+
+    name = "gemini"
+
+    def _task(self, submission) -> dict:
+        ex = submission.exercise
+        task = {
+            "title": ex.title,
+            "exercise_type": ex.exercise_type,
+            "band": getattr(ex, "band", None),
+            "topic": getattr(ex, "topic", None),
+            "prompt": (ex.prompt_text or "")[:6000],
+            "passage_or_context": (ex.content_text or "")[:8000] or None,
+            "grading_strictness": _STRICTNESS_TEXT[self.strictness],
+        }
+        template = RubricTemplate.resolve_for(ex)
+        if template is not None:
+            task["rubric"] = {
+                "name": template.name,
+                "scale": f"{template.scale_min}-{template.scale_max} step {template.score_step}",
+                "criteria": [
+                    {
+                        "code": c.code,
+                        "name": c.name,
+                        "description": c.description or "",
+                        "bands": [
+                            {"band": str(d.band_value), "descriptor": d.descriptor}
+                            for d in c.band_descriptors.all()
+                        ],
+                    }
+                    for c in template.criteria.all()
+                ],
+            }
+        return task
+
+    @staticmethod
+    def _finish(data: dict, engine: str) -> dict:
+        try:
+            score = _clamp(Decimal(str(data.get("score", 0))))
+        except Exception:  # non-numeric junk from a text model
+            raise gemini.GeminiError(f"{engine} returned a non-numeric score: {data.get('score')!r}")
+        comments = (data.get("comments") or "").strip()
+        criteria = data.get("criteria") or []
+        if criteria:
+            lines = [f"- {c.get('code')}: {c.get('band')} — {c.get('note', '')}".rstrip(" —") for c in criteria]
+            comments = comments + "\n\nRubric:\n" + "\n".join(lines)
+        return {"score": score, "comments": f"[AI · {engine}] {comments}", "criteria": criteria}
+
+    def grade_writing(self, submission) -> dict:
+        text = (submission.writing_text or "").strip()
+        if not text:
+            raise ValueError("Submission has no writing_text to grade")
+        user = (
+            "TASK (JSON):\n" + json.dumps(self._task(submission), ensure_ascii=False, indent=1)
+            + "\n\nSTUDENT RESPONSE:\n" + text[:12000]
+        )
+        data = gemini.generate_json(
+            system=_GRADER_SYSTEM, user=user, schema=_GRADE_SCHEMA, temperature=0.2,
+        )
+        return self._finish(data, f"gemini:{gemini.model_name()}")
+
+    def transcribe_and_score_speaking(self, submission) -> dict:
+        url = submission.audio_recording_url
+        if not url:
+            raise ValueError("Speaking submission has no audio_recording_url")
+        audio = gemini.resolve_audio(url)  # ValueError if unreachable
+        user = (
+            "TASK (JSON):\n" + json.dumps(self._task(submission), ensure_ascii=False, indent=1)
+            + "\n\nThe student's spoken response is the attached audio."
+        )
+        data = gemini.generate_json(
+            system=_SPEAKING_SYSTEM, user=user, schema=_SPEAK_SCHEMA,
+            temperature=0.2, audio=audio,
+        )
+        result = self._finish(data, f"gemini:{gemini.model_name()}")
+        result["transcript"] = (data.get("transcript") or "").strip()
+        return result
+
