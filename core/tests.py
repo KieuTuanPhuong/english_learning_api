@@ -17,6 +17,7 @@ from config.asgi import application
 
 from core import mock_tests
 from core.models import (
+    AiInsight,
     AiModel,
     AnnotationCategory,
     Assignment,
@@ -1662,3 +1663,205 @@ class PronunciationTests(APITransactionTestCase):
             reverse("pronunciation-drill-attempts", args=[self.drill.id]),
             {"audio": big}, format="multipart")
         self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+
+
+@override_settings(AI_ASSIST_BACKEND="mock")
+class AiCoachingTests(APITransactionTestCase):
+    """Teacher-feedback review + student mistake explanation (core/ai/assist.py)
+    against the deterministic mock backend. Gemini is never called here."""
+
+    def setUp(self):
+        self.teacher = User.objects.create_user(
+            email="ct@t.app", password="password123", full_name="Teacher",
+            role=UserRole.TEACHER)
+        self.other_teacher = User.objects.create_user(
+            email="co@t.app", password="password123", full_name="Other",
+            role=UserRole.TEACHER)
+        self.student = User.objects.create_user(
+            email="cs@t.app", password="password123", full_name="Student",
+            role=UserRole.STUDENT)
+        self.stranger = User.objects.create_user(
+            email="cx@t.app", password="password123", full_name="Stranger",
+            role=UserRole.STUDENT)
+        self.module = LearningModule.objects.create(title="M", created_by=self.teacher)
+        self.klass = Class.objects.create(
+            class_name="C", teacher=self.teacher, academic_year="2026")
+        ClassStudent.objects.create(klass=self.klass, student=self.student)
+
+        self.writing_ex = Exercise.objects.create(
+            module=self.module, title="W", exercise_type=ExerciseType.WRITING,
+            prompt_text="Describe your weekend.", created_by=self.teacher)
+        self.writing_sub = Submission.objects.create(
+            assignment=Assignment.objects.create(
+                klass=self.klass, exercise=self.writing_ex, assigned_by=self.teacher),
+            exercise=self.writing_ex, student=self.student,
+            submission_type=SubmissionType.WRITING,
+            writing_text="Yesterday I go to the park with my friend.")
+
+        self.quiz_ex = Exercise.objects.create(
+            module=self.module, title="Q", exercise_type=ExerciseType.QUIZ,
+            prompt_text="Pick the right word.", created_by=self.teacher)
+        q = Question.objects.create(exercise=self.quiz_ex, text="She ___ tea.", order=1)
+        self.q_right = QuestionOption.objects.create(question=q, text="drinks", is_correct=True, order=1)
+        self.q_wrong = QuestionOption.objects.create(question=q, text="drink", is_correct=False, order=2)
+        q2 = Question.objects.create(
+            exercise=self.quiz_ex, text="The capital of France is [[Paris]].", order=2)
+        self.quiz_sub = Submission.objects.create(
+            exercise=self.quiz_ex, student=self.student,
+            submission_type=SubmissionType.QUIZ,
+            answers={"version": 1, "responses": [
+                {"question_id": q.id, "type": "mcq", "option_id": self.q_wrong.id},
+                {"question_id": q2.id, "type": "fill_blank", "text": '["Paris"]'},
+            ]})
+        self.quiz_sub.grade()
+        self.quiz_sub.save(update_fields=["auto_score"])
+
+
+    def _login(self, user):
+        resp = self.client.post(reverse("login"), {"email": user.email, "password": "password123"})
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {resp.data['access_token']}")
+
+    # ---- context builder ----
+    def test_context_receptive_breakdown_marks_wrong_and_right(self):
+        from core.ai.assist import build_context
+        ctx = build_context(self.quiz_sub)
+        self.assertEqual(ctx["submission_type"], "quiz")
+        rows = ctx["questions"]
+        self.assertEqual(len(rows), 2)
+        self.assertFalse(rows[0]["is_correct"])
+        self.assertEqual(rows[0]["student_answer"], ["drink"])
+        self.assertEqual(rows[0]["correct_options"], ["drinks"])
+        self.assertTrue(rows[1]["is_correct"])
+        self.assertEqual(rows[1]["correct_answers"], ["Paris"])
+        # The key must be masked in the question text sent to the model.
+        self.assertNotIn("[[Paris]]", rows[1]["question"])
+
+    # ---- feedback review ----
+    def test_teacher_reviews_draft_feedback(self):
+        self._login(self.teacher)
+        url = f"/api/submissions/{self.writing_sub.id}/ai-review-feedback/"
+        resp = self.client.post(url, {"score": "70", "comments": "Good job."}, format="json")
+        self.assertEqual(resp.status_code, 200, resp.data)
+        body = resp.data
+        self.assertEqual(body["engine"], "mock")
+        self.assertIn(body["rating"], range(1, 6))
+        areas = {r["area"] for r in body["recommendations"]}
+        self.assertIn("specificity", areas)
+        self.assertIn("actionability", areas)
+        self.assertTrue(body["suggested_comment"].startswith("Good job."))
+        # Nothing persisted.
+        self.assertEqual(Feedback.objects.count(), 0)
+        self.assertEqual(AiInsight.objects.count(), 0)
+
+    def test_review_rejects_empty_draft_and_students(self):
+        self._login(self.teacher)
+        url = f"/api/submissions/{self.writing_sub.id}/ai-review-feedback/"
+        resp = self.client.post(url, {"comments": "  "}, format="json")
+        self.assertEqual(resp.status_code, 400)
+        self._login(self.student)
+        resp = self.client.post(url, {"comments": "hi"}, format="json")
+        self.assertEqual(resp.status_code, 403)
+
+    def test_review_accepts_rubric_cells(self):
+        template = RubricTemplate.objects.create(
+            name="R", slug="r-w", exercise_type=ExerciseType.WRITING,
+            is_default_for_type=True)
+        crit = RubricCriterion.objects.create(template=template, name="Task", code="task", order=1)
+        self._login(self.teacher)
+        url = f"/api/submissions/{self.writing_sub.id}/ai-review-feedback/"
+        resp = self.client.post(url, {
+            "comments": "Nice ideas, try to add more detail next time and practice tenses.",
+            "criterion_scores": [{"criterion_id": crit.id, "score": "6", "note": "ok"}],
+        }, format="json")
+        self.assertEqual(resp.status_code, 200, resp.data)
+        self.assertNotIn(
+            "score_alignment", {r["area"] for r in resp.data["recommendations"]})
+
+    # ---- mistake explanation ----
+    def test_student_generates_and_reads_explanation(self):
+        self._login(self.student)
+        url = f"/api/submissions/{self.quiz_sub.id}/ai-explain/"
+        self.assertEqual(self.client.get(url).status_code, 404)
+        resp = self.client.post(url)
+        self.assertEqual(resp.status_code, 201, resp.data)
+        payload = resp.data["payload"]
+        self.assertEqual(resp.data["kind"], "mistake_explanation")
+        self.assertEqual(payload["engine"], "mock")
+        self.assertEqual(len(payload["mistakes"]), 1)
+        self.assertEqual(payload["mistakes"][0]["correction"], "drinks")
+        self.assertEqual(payload["mistakes"][0]["category"], "comprehension")
+        # GET serves the newest stored row; regenerate inserts another.
+        got = self.client.get(url)
+        self.assertEqual(got.status_code, 200)
+        self.assertEqual(got.data["id"], resp.data["id"])
+        again = self.client.post(url)
+        self.assertEqual(again.status_code, 201)
+        self.assertNotEqual(again.data["id"], resp.data["id"])
+        self.assertEqual(self.client.get(url).data["id"], again.data["id"])
+        self.assertEqual(AiInsight.objects.filter(submission=self.quiz_sub).count(), 2)
+
+    def test_writing_explanation_and_access_control(self):
+        url = f"/api/submissions/{self.writing_sub.id}/ai-explain/"
+        self._login(self.stranger)
+        self.assertEqual(self.client.post(url).status_code, 403)
+        self.assertEqual(self.client.get(url).status_code, 403)
+        # A teacher who neither teaches the class nor owns the exercise.
+        self._login(self.other_teacher)
+        self.assertEqual(self.client.post(url).status_code, 403)
+        # Class teacher / exercise owner may generate for the student.
+        self._login(self.teacher)
+        resp = self.client.post(url)
+        self.assertEqual(resp.status_code, 201, resp.data)
+        self.assertEqual(resp.data["payload"]["mistakes"][0]["category"], "grammar")
+        # Owner reads it.
+        self._login(self.student)
+        self.assertEqual(self.client.get(url).status_code, 200)
+
+    def test_speaking_and_empty_submissions_rejected(self):
+        speaking_ex = Exercise.objects.create(
+            module=self.module, title="S", exercise_type=ExerciseType.SPEAKING,
+            prompt_text="Talk.", created_by=self.teacher)
+        speaking = Submission.objects.create(
+            exercise=speaking_ex, student=self.student,
+            submission_type=SubmissionType.SPEAKING,
+            audio_recording_url="https://example.com/a.webm")
+        empty = Submission.objects.create(
+            exercise=self.writing_ex, student=self.student,
+            submission_type=SubmissionType.WRITING, writing_text="")
+        self._login(self.student)
+        self.assertEqual(
+            self.client.post(f"/api/submissions/{speaking.id}/ai-explain/").status_code, 400)
+        self.assertEqual(
+            self.client.post(f"/api/submissions/{empty.id}/ai-explain/").status_code, 400)
+
+    def test_gemini_failure_maps_to_502(self):
+        from unittest import mock
+        from core.ai.gemini import GeminiError
+        self._login(self.student)
+        with override_settings(AI_ASSIST_BACKEND="gemini"), mock.patch(
+            "core.ai.assist.gemini.generate_json", side_effect=GeminiError("quota")
+        ):
+            resp = self.client.post(f"/api/submissions/{self.writing_sub.id}/ai-explain/")
+        self.assertEqual(resp.status_code, 502)
+        self.assertIn("quota", str(resp.data["detail"]))
+        self.assertEqual(AiInsight.objects.count(), 0)
+
+    def test_gemini_backend_parses_structured_reply(self):
+        from unittest import mock
+        from core.ai import gemini
+        fake = {"candidates": [{"content": {"parts": [{"text": json.dumps({
+            "summary": "s", "mistakes": [], "strengths": ["a"], "practice_suggestions": ["b"],
+        })}]}}]}
+        self.assertEqual(gemini.parse_response(json.dumps(fake))["summary"], "s")
+        with self.assertRaises(gemini.GeminiError):
+            gemini.parse_response(json.dumps({"error": {"message": "nope"}}))
+        with self.assertRaises(gemini.GeminiError):
+            gemini.parse_response(json.dumps({"candidates": [{"content": {"parts": [{"text": "not json"}]}}]}))
+        self._login(self.student)
+        with override_settings(AI_ASSIST_BACKEND="gemini", GEMINI_API_KEY="k"), mock.patch(
+            "core.ai.assist.gemini.generate_json", return_value=json.loads(fake["candidates"][0]["content"]["parts"][0]["text"])
+        ) as call:
+            resp = self.client.post(f"/api/submissions/{self.writing_sub.id}/ai-explain/")
+        self.assertEqual(resp.status_code, 201, resp.data)
+        self.assertTrue(resp.data["engine"].startswith("gemini:"))
+        self.assertEqual(call.call_args.kwargs["schema"]["required"][0], "summary")

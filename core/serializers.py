@@ -15,6 +15,7 @@ from rest_framework import serializers
 
 from . import mock_tests
 from .models import (
+    AiInsight,
     Assignment,
     Class,
     ClassStudent,
@@ -403,6 +404,81 @@ class FeedbackSerializer(serializers.ModelSerializer):
             feedback.score = template.normalize(overall)
             feedback.save(update_fields=["score"])
         return feedback
+
+
+# ---------- AI coaching (core/ai/assist.py) ----------
+class CriterionScoreDraftSerializer(serializers.Serializer):
+    """A rubric cell in a *draft* grade (nothing is written)."""
+    criterion_id = serializers.PrimaryKeyRelatedField(
+        source="criterion", queryset=RubricCriterion.objects.all()
+    )
+    score = serializers.DecimalField(max_digits=5, decimal_places=1)
+    note = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+
+
+class FeedbackReviewRequestSerializer(serializers.Serializer):
+    """Teacher's draft feedback to be reviewed by the AI before (or after) posting."""
+    score = serializers.DecimalField(
+        max_digits=5, decimal_places=2,
+        min_value=Decimal("0"), max_value=Decimal("100"),
+        required=False, allow_null=True,
+    )
+    comments = serializers.CharField(required=False, allow_blank=True, default="")
+    criterion_scores = CriterionScoreDraftSerializer(many=True, required=False)
+
+    def validate(self, attrs):
+        if not (attrs.get("comments") or "").strip() and attrs.get("score") is None \
+                and not attrs.get("criterion_scores"):
+            raise serializers.ValidationError(
+                "Provide comments, a score, or criterion scores to review."
+            )
+        return attrs
+
+
+class AiRecommendationSerializer(serializers.Serializer):
+    area = serializers.CharField()  # specificity|tone|actionability|accuracy|coverage|score_alignment|language_level
+    issue = serializers.CharField()
+    suggestion = serializers.CharField()
+
+
+class FeedbackReviewSerializer(serializers.Serializer):
+    """Response of POST /submissions/{id}/ai-review-feedback/ (not persisted)."""
+    summary = serializers.CharField()
+    rating = serializers.IntegerField(min_value=1, max_value=5)
+    strengths = serializers.ListField(child=serializers.CharField())
+    recommendations = AiRecommendationSerializer(many=True)
+    score_alignment = serializers.CharField()
+    suggested_comment = serializers.CharField()
+    engine = serializers.CharField()
+
+
+class AiMistakeSerializer(serializers.Serializer):
+    location = serializers.CharField()
+    student_answer = serializers.CharField(allow_blank=True)
+    correction = serializers.CharField(allow_blank=True)
+    category = serializers.CharField()  # grammar|vocabulary|spelling|punctuation|coherence|task_response|comprehension|inference|detail|other
+    explanation = serializers.CharField()
+    tip = serializers.CharField(allow_blank=True)
+
+
+class MistakeExplanationSerializer(serializers.Serializer):
+    summary = serializers.CharField()
+    mistakes = AiMistakeSerializer(many=True)
+    strengths = serializers.ListField(child=serializers.CharField())
+    practice_suggestions = serializers.ListField(child=serializers.CharField())
+    engine = serializers.CharField()
+
+
+class AiInsightSerializer(serializers.ModelSerializer):
+    """A stored coaching result. ``payload`` is MistakeExplanation-shaped for
+    kind=mistake_explanation (the only kind persisted today)."""
+    submission_id = serializers.PrimaryKeyRelatedField(source="submission", read_only=True)
+    payload = MistakeExplanationSerializer(read_only=True)
+
+    class Meta:
+        model = AiInsight
+        fields = ["id", "submission_id", "kind", "payload", "engine", "created_at"]
+        read_only_fields = fields
 
 
 # ---------- Study Material ----------

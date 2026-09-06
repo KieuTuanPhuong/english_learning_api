@@ -6,6 +6,7 @@ FastAPI version used (DATABASE_URL, SECRET_KEY, ACCESS_TOKEN_EXPIRE_MINUTES).
 """
 
 import os
+import sys
 from datetime import timedelta
 from pathlib import Path
 from urllib.parse import urlparse
@@ -134,6 +135,7 @@ SPECTACULAR_SETTINGS = {
         # another hash-suffixed StatusXxxEnum.
         "AttemptStatusEnum": "core.models.AttemptStatus.choices",
         "SectionStatusEnum": "core.models.SectionStatus.choices",
+        "AiInsightKindEnum": "core.models.AiInsightKind.choices",
     },
     # Bearer JWT — show the Authorize button in Swagger UI.
     "SECURITY": [{"jwtAuth": []}],
@@ -195,10 +197,25 @@ MEDIA_URL = "/media/"
 # AI grading integration settings
 AI_BACKEND = os.getenv("AI_BACKEND", "mock").lower()
 
+# AI coaching assistants (teacher-feedback review, student mistake explanation;
+# core/ai/assist.py). "mock" = deterministic/offline, "gemini" = live Gemini
+# call via GEMINI_API_KEY. Defaults to gemini only when a key is present.
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
+AI_ASSIST_BACKEND = (
+    os.getenv("AI_ASSIST_BACKEND") or ("gemini" if GEMINI_API_KEY else "mock")
+).lower()
+
 # Pronunciation-assessment engine switch (sibling of AI_BACKEND). "mock"
 # (default, deterministic/offline) or "azure" (real; requires ffmpeg + Azure
 # env keys) — docs/research/04-pronunciation-practice.md §4.4.
 PRONUNCIATION_BACKEND = os.getenv("PRONUNCIATION_BACKEND", "mock").lower()
+
+# The test suite must never spend Gemini quota or depend on the network: force
+# every AI switch to the deterministic mock under `manage.py test`. Individual
+# tests opt back in with override_settings(...="gemini") + a patched client.
+if len(sys.argv) > 1 and sys.argv[1] == "test":
+    AI_BACKEND = PRONUNCIATION_BACKEND = AI_ASSIST_BACKEND = "mock"
 
 # Reports — PDF export is deferred behind reportlab; CSV is always available.
 REPORTS_PDF_ENABLED = os.getenv("REPORTS_PDF_ENABLED", "false").lower() == "true"
