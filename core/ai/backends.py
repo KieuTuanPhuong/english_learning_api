@@ -3,9 +3,11 @@
 ============================== STUB vs REAL ==============================
 MockBackend   -> DETERMINISTIC, no network. Default everywhere. Scores derive
                  from text length + a keyword rubric so tests/seed are stable.
-GeminiBackend -> LIVE. ``AI_BACKEND=gemini`` + ``GEMINI_API_KEY``. Writing is
-                 rubric-graded from text; Speaking is transcribed AND scored in
-                 one multimodal call (audio inline) — no Whisper needed.
+LlmBackend    -> LIVE. ``AI_BACKEND=llm`` (alias ``gemini``). Writing is
+                 rubric-graded from text by the provider/model in
+                 ``AI_GRADING_MODEL`` (Gemini, or NVIDIA-hosted Kimi K3 /
+                 DeepSeek V4 — see core/ai/llm.py); Speaking is transcribed AND
+                 scored in one multimodal Gemini call (audio inline).
 RealBackend   -> STUBBED. Documents exactly where the OpenAI Whisper STT and
                 LLM rubric calls go. Raises until wired, so a misconfigured
                 deploy fails loudly instead of silently mis-grading.
@@ -20,7 +22,7 @@ from decimal import Decimal, ROUND_HALF_UP
 
 # pyrefly: ignore [missing-import]
 from ..models import GradingStrictness, RubricTemplate
-from . import gemini
+from . import gemini, llm
 
 # Strictness -> multiplier applied to the deterministic mock score.
 _STRICTNESS_FACTOR = {
@@ -192,10 +194,11 @@ _SPEAKING_SYSTEM = _GRADER_SYSTEM + textwrap.dedent("""
 """)
 
 
-class GeminiBackend(BaseAIBackend):
-    """Live grading through Gemini (``core/ai/gemini.py``)."""
+class LlmBackend(BaseAIBackend):
+    """Live grading through the configured LLM provider (``core/ai/llm.py``).
+    Text -> ``AI_GRADING_MODEL``; audio -> Gemini."""
 
-    name = "gemini"
+    name = "llm"
 
     def _task(self, submission) -> dict:
         ex = submission.exercise
@@ -249,10 +252,11 @@ class GeminiBackend(BaseAIBackend):
             "TASK (JSON):\n" + json.dumps(self._task(submission), ensure_ascii=False, indent=1)
             + "\n\nSTUDENT RESPONSE:\n" + text[:12000]
         )
-        data = gemini.generate_json(
-            system=_GRADER_SYSTEM, user=user, schema=_GRADE_SCHEMA, temperature=0.2,
+        data = llm.generate_json(
+            "grading", system=_GRADER_SYSTEM, user=user, schema=_GRADE_SCHEMA,
+            temperature=0.2,
         )
-        return self._finish(data, f"gemini:{gemini.model_name()}")
+        return self._finish(data, data.get("engine") or llm.label("grading"))
 
     def transcribe_and_score_speaking(self, submission) -> dict:
         url = submission.audio_recording_url
@@ -263,11 +267,13 @@ class GeminiBackend(BaseAIBackend):
             "TASK (JSON):\n" + json.dumps(self._task(submission), ensure_ascii=False, indent=1)
             + "\n\nThe student's spoken response is the attached audio."
         )
-        data = gemini.generate_json(
-            system=_SPEAKING_SYSTEM, user=user, schema=_SPEAK_SCHEMA,
+        data = llm.generate_json(
+            "grading", system=_SPEAKING_SYSTEM, user=user, schema=_SPEAK_SCHEMA,
             temperature=0.2, audio=audio,
         )
-        result = self._finish(data, f"gemini:{gemini.model_name()}")
+        result = self._finish(data, data.get("engine") or llm.label("grading", audio=True))
         result["transcript"] = (data.get("transcript") or "").strip()
         return result
 
+
+GeminiBackend = LlmBackend  # backwards-compatible name
