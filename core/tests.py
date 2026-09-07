@@ -1865,3 +1865,183 @@ class AiCoachingTests(APITransactionTestCase):
         self.assertEqual(resp.status_code, 201, resp.data)
         self.assertTrue(resp.data["engine"].startswith("gemini:"))
         self.assertEqual(call.call_args.kwargs["schema"]["required"][0], "summary")
+
+
+@override_settings(MEDIA_ROOT=tempfile.mkdtemp())
+class GeminiBackendTests(APITransactionTestCase):
+    """Gemini-backed grading / speaking / pronunciation with the HTTP client
+    patched — verifies prompt assembly, audio resolution and result mapping."""
+
+    def setUp(self):
+        self.teacher = User.objects.create_user(
+            email="gt@t.app", password="password123", full_name="T", role=UserRole.TEACHER)
+        self.student = User.objects.create_user(
+            email="gs@t.app", password="password123", full_name="S", role=UserRole.STUDENT)
+        self.module = LearningModule.objects.create(title="M", created_by=self.teacher)
+        self.writing_ex = Exercise.objects.create(
+            module=self.module, title="W", exercise_type=ExerciseType.WRITING,
+            prompt_text="Write about your city.", created_by=self.teacher)
+        self.speaking_ex = Exercise.objects.create(
+            module=self.module, title="S", exercise_type=ExerciseType.SPEAKING,
+            prompt_text="Describe your hometown.", created_by=self.teacher)
+        from django.conf import settings as dj
+        import os
+        os.makedirs(os.path.join(dj.MEDIA_ROOT, "mock-tests"), exist_ok=True)
+        self.audio_path = os.path.join(dj.MEDIA_ROOT, "mock-tests", "a.webm")
+        with open(self.audio_path, "wb") as fh:
+            fh.write(b"\x1aE\xdf\xa3fake-webm")
+
+    def _login(self, user):
+        resp = self.client.post(reverse("login"), {"email": user.email, "password": "password123"})
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {resp.data['access_token']}")
+
+    def test_resolve_audio_media_url_local_path_and_errors(self):
+        from core.ai.gemini import resolve_audio
+        mime, data = resolve_audio("/media/mock-tests/a.webm")
+        self.assertEqual(mime, "audio/webm")
+        self.assertTrue(data.startswith(b"\x1aE"))
+        mime, _ = resolve_audio(self.audio_path)
+        self.assertEqual(mime, "audio/webm")
+        mime, _ = resolve_audio("http://localhost:8000/media/mock-tests/a.webm")
+        self.assertEqual(mime, "audio/webm")
+        with self.assertRaises(ValueError):
+            resolve_audio("/media/mock-tests/missing.webm")
+        with self.assertRaises(ValueError):
+            resolve_audio("")
+        with self.assertRaises(ValueError):
+            resolve_audio("ftp://x/y.mp3")
+
+    def test_generate_json_attaches_inline_audio(self):
+        from unittest import mock
+        from core.ai import gemini
+        captured = {}
+
+        class FakeResp:
+            def __init__(self, body): self.body = body
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self): return self.body
+
+        def fake_open(req, timeout=None):
+            captured["body"] = json.loads(req.data)
+            captured["key"] = req.get_header("X-goog-api-key")
+            return FakeResp(json.dumps({"candidates": [{"content": {"parts": [
+                {"text": json.dumps({"transcript": "hello"})}]}}]}).encode())
+
+        with override_settings(GEMINI_API_KEY="k"), mock.patch(
+            "core.ai.gemini.urllib.request.urlopen", side_effect=fake_open):
+            out = gemini.transcribe("/media/mock-tests/a.webm")
+        self.assertEqual(out, "hello")
+        self.assertEqual(captured["key"], "k")
+        parts = captured["body"]["contents"][0]["parts"]
+        self.assertEqual(parts[0]["inlineData"]["mimeType"], "audio/webm")
+        self.assertEqual(parts[1]["text"], "Transcribe the attached audio.")
+        self.assertEqual(captured["body"]["generationConfig"]["responseMimeType"], "application/json")
+
+    def test_gemini_backend_grades_writing_and_records_feedback(self):
+        from unittest import mock
+        sub = Submission.objects.create(
+            exercise=self.writing_ex, student=self.student,
+            submission_type=SubmissionType.WRITING, writing_text="My city is big.")
+        self._login(self.teacher)
+        with override_settings(AI_BACKEND="gemini", GEMINI_API_KEY="k"), mock.patch(
+            "core.ai.backends.gemini.generate_json",
+            return_value={"score": 72.4, "comments": "Nice.", "criteria": [
+                {"code": "task_response", "band": 6, "note": "ok"}]},
+        ) as call:
+            resp = self.client.post(f"/api/submissions/{sub.id}/ai-evaluate/")
+        self.assertEqual(resp.status_code, 201, resp.data)
+        self.assertEqual(resp.data["score"], "72.40")
+        self.assertTrue(resp.data["is_ai_generated"])
+        self.assertIn("task_response: 6", resp.data["comments"])
+        self.assertIn("My city is big.", call.call_args.kwargs["user"])
+        self.assertIsNone(call.call_args.kwargs.get("audio"))
+        sub.refresh_from_db()
+        self.assertEqual(sub.status, SubmissionStatus.AI_GRADED)
+
+    def test_gemini_backend_scores_speaking_from_local_audio(self):
+        from unittest import mock
+        sub = Submission.objects.create(
+            exercise=self.speaking_ex, student=self.student,
+            submission_type=SubmissionType.SPEAKING,
+            audio_recording_url="/media/mock-tests/a.webm")
+        self._login(self.teacher)
+        with override_settings(AI_BACKEND="gemini", GEMINI_API_KEY="k"), mock.patch(
+            "core.ai.backends.gemini.generate_json",
+            return_value={"transcript": "um my town", "score": 55, "comments": "Work on tense.", "criteria": []},
+        ) as call:
+            resp = self.client.post(f"/api/submissions/{sub.id}/ai-evaluate/")
+        self.assertEqual(resp.status_code, 201, resp.data)
+        self.assertEqual(resp.data["score"], "55.00")
+        self.assertEqual(call.call_args.kwargs["audio"][0], "audio/webm")
+        # Missing recording -> 400, unreachable Gemini -> 502.
+        sub.audio_recording_url = "/media/mock-tests/nope.webm"
+        sub.save()
+        with override_settings(AI_BACKEND="gemini", GEMINI_API_KEY="k"):
+            self.assertEqual(
+                self.client.post(f"/api/submissions/{sub.id}/ai-evaluate/").status_code, 400)
+        sub.audio_recording_url = "/media/mock-tests/a.webm"
+        sub.save()
+        from core.ai.gemini import GeminiError
+        with override_settings(AI_BACKEND="gemini", GEMINI_API_KEY="k"), mock.patch(
+            "core.ai.backends.gemini.generate_json", side_effect=GeminiError("503")):
+            self.assertEqual(
+                self.client.post(f"/api/submissions/{sub.id}/ai-evaluate/").status_code, 502)
+
+    def test_gemini_pronunciation_backend_maps_word_results(self):
+        from unittest import mock
+        drill = PronunciationDrill.objects.create(
+            target_text="ship sheep", drill_type=DrillType.MINIMAL_PAIR,
+            created_by=self.teacher)
+        self._login(self.student)
+        payload = {
+            "transcript": "ship sheep", "accuracy": 81.5, "fluency": 90,
+            "completeness": 100, "prosody": 70, "feedback": "Lengthen /iː/.",
+            "words": [
+                {"word": "ship", "accuracy": 88, "error_type": "None",
+                 "phonemes": [{"phoneme": "ʃ", "accuracy": 95}, {"phoneme": "ɪ", "accuracy": 80}]},
+                {"word": "sheep", "accuracy": 55, "error_type": "Mispronunciation",
+                 "phonemes": [{"phoneme": "iː", "accuracy": 40}]},
+            ],
+        }
+        audio = SimpleUploadedFile("try.webm", b"\x1aE\xdf\xa3x", content_type="audio/webm")
+        with override_settings(PRONUNCIATION_BACKEND="gemini", GEMINI_API_KEY="k"), mock.patch(
+            "core.ai.pronunciation.gemini.generate_json", return_value=payload) as call:
+            resp = self.client.post(
+                f"/api/pronunciation/drills/{drill.id}/attempts/", {"audio": audio}, format="multipart")
+        self.assertEqual(resp.status_code, 201, resp.data)
+        self.assertEqual(call.call_args.kwargs["audio"][0], "audio/webm")
+        self.assertIn('"ship sheep"', call.call_args.kwargs["user"])
+        attempt = PronunciationAttempt.objects.get(pk=resp.data["id"])
+        self.assertEqual(attempt.accuracy_score, Decimal("81.50"))
+        self.assertEqual(attempt.overall_score, Decimal("85.38"))  # (81.5+90+100+70)/4
+        self.assertTrue(attempt.engine.startswith("gemini:"))
+        self.assertIsNone(attempt.word_results[0]["error_type"])
+        self.assertEqual(attempt.word_results[1]["error_type"], "Mispronunciation")
+        self.assertEqual(attempt.engine_metadata["transcript"], "ship sheep")
+
+    def test_speaking_explanation_uses_transcript(self):
+        from unittest import mock
+        sub = Submission.objects.create(
+            exercise=self.speaking_ex, student=self.student,
+            submission_type=SubmissionType.SPEAKING,
+            audio_recording_url="/media/mock-tests/a.webm")
+        self._login(self.student)
+        url = f"/api/submissions/{sub.id}/ai-explain/"
+        # Mock assist backend cannot transcribe -> 400.
+        self.assertEqual(self.client.post(url).status_code, 400)
+        explain = {"summary": "s", "mistakes": [], "strengths": [], "practice_suggestions": []}
+        with override_settings(AI_ASSIST_BACKEND="gemini", GEMINI_API_KEY="k"), mock.patch(
+            "core.ai.assist.gemini.transcribe", return_value="I goes home") as tr, mock.patch(
+            "core.ai.assist.gemini.generate_json", return_value=dict(explain)) as gen:
+            resp = self.client.post(url)
+        self.assertEqual(resp.status_code, 201, resp.data)
+        self.assertIn('"transcript": "I goes home"', gen.call_args.kwargs["user"])
+        self.assertEqual(AiInsight.objects.get().payload["transcript"], "I goes home")
+        # Second run reuses the stored transcript instead of transcribing again.
+        with override_settings(AI_ASSIST_BACKEND="gemini", GEMINI_API_KEY="k"), mock.patch(
+            "core.ai.assist.gemini.transcribe") as tr2, mock.patch(
+            "core.ai.assist.gemini.generate_json", return_value=dict(explain)):
+            self.assertEqual(self.client.post(url).status_code, 201)
+        tr.assert_called_once()
+        tr2.assert_not_called()

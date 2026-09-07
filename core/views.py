@@ -705,11 +705,7 @@ class SubmissionViewSet(mixins.CreateModelMixin, viewsets.GenericViewSet):
         if request.user.role not in (UserRole.TEACHER, UserRole.ADMIN):
             raise PermissionDenied("Insufficient permissions")
         submission = self.get_object()
-        try:
-            fb = evaluate_submission(submission)
-        except (ValueError, NotImplementedError) as exc:
-            # ValueError -> missing media; NotImplementedError -> RealBackend not wired.
-            raise ValidationError(str(exc))
+        fb = _ai_call(evaluate_submission, submission)
         return Response(
             s.FeedbackSerializer(fb).data, status=status.HTTP_201_CREATED
         )
@@ -836,10 +832,7 @@ class SubmissionViewSet(mixins.CreateModelMixin, viewsets.GenericViewSet):
             writing_text=ser.validated_data.get("writing_text"),
             audio_recording_url=ser.validated_data.get("audio_recording_url"),
         )
-        try:
-            fb = evaluate_submission(submission)
-        except (ValueError, NotImplementedError) as exc:
-            raise ValidationError(str(exc))
+        fb = _ai_call(evaluate_submission, submission)
         return Response(
             {
                 "submission": s.SubmissionSerializer(submission).data,
@@ -1998,6 +1991,8 @@ class PronunciationDrillViewSet(viewsets.ModelViewSet):
             # Loud failure when the real engine is misconfigured; the attempt row
             # survives (nullable scores) so a fixed deploy can re-score it.
             raise ValidationError(str(exc))
+        except GeminiError as exc:
+            raise AiUnavailable(f"AI service unavailable: {exc}")
         return Response(
             s.PronunciationAttemptSerializer(
                 attempt, context={"request": request}
