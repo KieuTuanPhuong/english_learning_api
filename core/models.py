@@ -562,6 +562,39 @@ class Feedback(models.Model):
         return f"Feedback {self.pk} on {self.submission_id}"
 
 
+# ---------- AI insights (Gemini coaching, core/ai/assist.py) ----------
+class AiInsightKind(models.TextChoices):
+    MISTAKE_EXPLANATION = "mistake_explanation", "Mistake explanation"
+    FEEDBACK_REVIEW = "feedback_review", "Feedback review"
+
+
+class AiInsight(models.Model):
+    """A stored AI coaching result for a submission. ``payload`` is the
+    schema-shaped JSON the assist backend returned (see ``core/ai/assist.py``
+    MISTAKES_SCHEMA / REVIEW_SCHEMA). One row per generation; the API serves
+    the newest for a (submission, kind) pair so regenerate == insert."""
+
+    submission = models.ForeignKey(
+        Submission, on_delete=models.CASCADE, related_name="ai_insights"
+    )
+    kind = models.CharField(max_length=30, choices=AiInsightKind.choices)
+    payload = models.JSONField()
+    engine = models.CharField(max_length=80, blank=True, default="")
+    requested_by = models.ForeignKey(
+        User, null=True, blank=True, on_delete=models.SET_NULL,
+        related_name="ai_insights_requested",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "ai_insights"
+        ordering = ["-created_at", "-id"]
+        indexes = [models.Index(fields=["submission", "kind", "-created_at"])]
+
+    def __str__(self):
+        return f"{self.kind} for submission {self.submission_id}"
+
+
 # ---------- Study Material ----------
 class StudyMaterial(models.Model):
     """Official reference document in the study-materials library.

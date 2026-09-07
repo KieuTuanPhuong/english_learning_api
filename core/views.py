@@ -24,6 +24,7 @@ from drf_spectacular.utils import (
 from rest_framework import mixins, serializers as drf_serializers, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import (
+    APIException,
     AuthenticationFailed,
     NotFound,
     PermissionDenied,
@@ -39,6 +40,8 @@ from rest_framework_simplejwt.tokens import RefreshToken
 
 from . import serializers as s
 from .models import (
+    AiInsight,
+    AiInsightKind,
     Assignment,
     Class,
     ClassStudent,
@@ -74,12 +77,31 @@ from asgiref.sync import async_to_sync
 from channels.layers import get_channel_layer
 
 from .ai import evaluate_submission
+from .ai import assist
+from .ai.gemini import GeminiError
 from .ai.pronunciation import assess_attempt
 from .audio import (
     MOCK_TEST_MAX_DURATION_SECONDS,
     MOCK_TEST_MAX_UPLOAD_BYTES,
     validate_upload,
 )
+
+
+class AiUnavailable(APIException):
+    """Gemini transport/quota failure -> 502 so the client can retry."""
+    status_code = status.HTTP_502_BAD_GATEWAY
+    default_code = "ai_unavailable"
+
+
+def _ai_call(fn, *args, **kwargs):
+    """Run an AI-layer call and map failures to HTTP: bad input / unwired
+    backend / missing key -> 400, Gemini unavailable -> 502."""
+    try:
+        return fn(*args, **kwargs)
+    except (ValueError, NotImplementedError, ImproperlyConfigured) as exc:
+        raise ValidationError(str(exc))
+    except GeminiError as exc:
+        raise AiUnavailable(f"AI service unavailable: {exc}")
 
 
 class MediaUploadThrottle(UserRateThrottle):
@@ -540,6 +562,8 @@ class SubmissionViewSet(mixins.CreateModelMixin, viewsets.GenericViewSet):
     def get_permissions(self):
         if self.action == "create":
             return _perms(IsStudent)
+        if self.action == "ai_review_feedback":
+            return _perms(IsTeacherOrAdmin)
         return _perms()
 
     # Receptive skills are auto-graded from `answers`; productive skills
@@ -689,6 +713,97 @@ class SubmissionViewSet(mixins.CreateModelMixin, viewsets.GenericViewSet):
         return Response(
             s.FeedbackSerializer(fb).data, status=status.HTTP_201_CREATED
         )
+
+    # ---- AI coaching (core/ai/assist.py) ----
+    _run_assist = staticmethod(_ai_call)
+
+    @staticmethod
+    def _can_coach(user, submission) -> bool:
+        """Read audience for coaching: everyone who may read feedback, plus the
+        teacher who owns the exercise (the inbox audience)."""
+        if can_view_submission_feedback(user, submission):
+            return True
+        if user.role == UserRole.TEACHER:
+            ex = submission.exercise
+            if ex.created_by_id == user.id:
+                return True
+            if ex.module_id and ex.module.created_by_id == user.id:
+                return True
+        return False
+
+    @extend_schema(
+        tags=["ai"],
+        summary="AI review of a teacher's (draft) feedback with recommendations",
+        description=(
+            "Teacher/Admin sends the feedback they are about to post (score, "
+            "comments, optional rubric cells). The AI reviews the FEEDBACK — "
+            "specificity, tone, actionability, accuracy, coverage, score "
+            "alignment — and returns strengths, recommendations and a "
+            "suggested rewrite. Nothing is persisted; the teacher decides."
+        ),
+        request=s.FeedbackReviewRequestSerializer,
+        responses={
+            200: s.FeedbackReviewSerializer,
+            400: OpenApiResponse(description="Empty draft, or AI backend not configured"),
+            502: OpenApiResponse(description="AI service unavailable"),
+        },
+    )
+    @action(detail=True, methods=["post"], url_path="ai-review-feedback")
+    def ai_review_feedback(self, request, pk=None):
+        submission = self.get_object()
+        ser = s.FeedbackReviewRequestSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        data = ser.validated_data
+        result = self._run_assist(
+            assist.review_feedback,
+            submission,
+            score=data.get("score"),
+            comments=data.get("comments") or "",
+            criterion_scores=data.get("criterion_scores"),
+        )
+        return Response(s.FeedbackReviewSerializer(result).data)
+
+    @extend_schema(
+        tags=["ai"],
+        summary="AI explanation of the mistakes in a submission",
+        description=(
+            "GET returns the newest stored explanation (404 if none yet). POST "
+            "generates a fresh one with the AI backend and stores it. Audience: "
+            "the student who owns the submission, the class teacher, a "
+            "reviewing teacher, the exercise owner, or an admin. Writing and "
+            "receptive (reading/listening/quiz) submissions only."
+        ),
+        responses={
+            200: s.AiInsightSerializer,
+            201: s.AiInsightSerializer,
+            400: OpenApiResponse(description="Unsupported submission or AI backend not configured"),
+            403: OpenApiResponse(description="Not permitted"),
+            404: OpenApiResponse(description="No explanation generated yet (GET)"),
+            502: OpenApiResponse(description="AI service unavailable"),
+        },
+        request=None,
+    )
+    @action(detail=True, methods=["get", "post"], url_path="ai-explain")
+    def ai_explain(self, request, pk=None):
+        submission = self.get_object()
+        if not self._can_coach(request.user, submission):
+            raise PermissionDenied("Not permitted to view this submission")
+        if request.method == "GET":
+            row = submission.ai_insights.filter(
+                kind=AiInsightKind.MISTAKE_EXPLANATION
+            ).first()
+            if row is None:
+                raise NotFound("No explanation generated yet")
+            return Response(s.AiInsightSerializer(row).data)
+        result = self._run_assist(assist.explain_mistakes, submission)
+        row = AiInsight.objects.create(
+            submission=submission,
+            kind=AiInsightKind.MISTAKE_EXPLANATION,
+            payload=result,
+            engine=result.get("engine", ""),
+            requested_by=request.user,
+        )
+        return Response(s.AiInsightSerializer(row).data, status=status.HTTP_201_CREATED)
 
     @extend_schema(
         tags=["ai"],

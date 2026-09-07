@@ -37,6 +37,7 @@ from .models import (
     User,
     WritingAnnotation,
     StudyMaterial,
+    AiInsight,
     AiModel,
     SystemLog,
 )
@@ -399,3 +400,11 @@ class PronunciationAttemptAdmin(admin.ModelAdmin):
         "completeness_score", "prosody_score", "word_results",
         "engine", "engine_metadata", "created_at",
     )
+
+
+@admin.register(AiInsight)
+class AiInsightAdmin(admin.ModelAdmin):
+    list_display = ("id", "submission", "kind", "engine", "requested_by", "created_at")
+    list_filter = ("kind", "engine")
+    search_fields = ("submission__id", "submission__student__email")
+    readonly_fields = ("payload", "created_at")
