@@ -26,6 +26,7 @@ from .models import (
     ItemFlow,
     LearningModule,
     LessonPlan,
+    Meeting,
     MockTestTemplate,
     PronunciationAttempt,
     PronunciationDrill,
@@ -164,7 +165,7 @@ class LearningModuleSerializer(serializers.ModelSerializer):
         model = LearningModule
         fields = [
             "id", "title", "description", "difficulty_level",
-            "created_by", "created_at",
+            "band", "topic", "created_by", "created_at",
         ]
         read_only_fields = ["id", "created_by", "created_at"]
 
@@ -212,6 +213,30 @@ class QuestionSerializer(serializers.ModelSerializer):
         read_only_fields = ["id", "created_at"]
 
 
+class ExerciseListSerializer(serializers.ModelSerializer):
+    """Catalog row for the browse-by-topic/band list.
+
+    Deliberately omits `questions`: QuestionOptionSerializer exposes
+    `is_correct`, so embedding them here would hand every student the answer
+    key for the whole catalog in one request. Prompt/passage bodies are left
+    out too — they belong on the detail endpoint, not in a long list."""
+
+    module_id = serializers.PrimaryKeyRelatedField(source="module", read_only=True)
+    module_title = serializers.CharField(
+        source="module.title", read_only=True, default=None
+    )
+    # Annotated by the viewset's list queryset.
+    question_count = serializers.IntegerField(read_only=True, default=0)
+
+    class Meta:
+        model = Exercise
+        fields = [
+            "id", "module_id", "module_title", "title", "exercise_type",
+            "band", "topic", "question_count", "created_at",
+        ]
+        read_only_fields = fields
+
+
 class ExerciseSerializer(serializers.ModelSerializer):
     module_id = serializers.PrimaryKeyRelatedField(
         source="module", queryset=LearningModule.objects.all(),
@@ -230,7 +255,7 @@ class ExerciseSerializer(serializers.ModelSerializer):
     class Meta:
         model = Exercise
         fields = [
-            "id", "module_id", "title", "exercise_type",
+            "id", "module_id", "title", "exercise_type", "band", "topic",
             "prompt_text", "content_text", "audio_prompt_url",
             "created_by", "questions", "rubric_template_id", "created_at",
         ]
@@ -1205,3 +1230,39 @@ class PronunciationAttemptCreateSerializer(serializers.Serializer):
     separately so drf-spectacular emits a multipart request schema."""
 
     audio = serializers.FileField()
+
+
+# ---------- Meeting ----------
+class MeetingSerializer(serializers.ModelSerializer):
+    class_id = serializers.PrimaryKeyRelatedField(
+        source="klass", queryset=Class.objects.all()
+    )
+    # Denormalized for the meetings list UI; avoids an extra classes fetch.
+    class_name = serializers.CharField(source="klass.class_name", read_only=True)
+    created_by = serializers.PrimaryKeyRelatedField(read_only=True)
+    created_by_name = serializers.CharField(
+        source="created_by.full_name", read_only=True, default=None
+    )
+    # Live elapsed seconds while running, final length once ended, null before
+    # the first peer joins — the client's clock starts from this value.
+    duration_seconds = serializers.IntegerField(read_only=True, allow_null=True)
+
+    class Meta:
+        model = Meeting
+        fields = [
+            "id", "class_id", "class_name", "title", "status",
+            "scheduled_at", "started_at", "duration_seconds",
+            "created_by", "created_by_name", "created_at", "ended_at",
+        ]
+        read_only_fields = [
+            "id", "status", "started_at", "duration_seconds",
+            "created_by", "created_at", "ended_at",
+        ]
+
+    def validate_scheduled_at(self, value):
+        # A booking in the past would sit in "scheduled" forever; the teacher
+        # wants either a future slot or a start-now room (null). One minute of
+        # slack absorbs clock skew between the browser and the server.
+        if value is not None and (timezone.now() - value).total_seconds() > 60:
+            raise serializers.ValidationError("Scheduled time is in the past.")
+        return value

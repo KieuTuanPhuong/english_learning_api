@@ -24,6 +24,7 @@ from core.models import (
     Assignment,
     AttemptMode,
     AttemptStatus,
+    BandLevel,
     Class,
     ClassStudent,
     CriterionScore,
@@ -32,6 +33,8 @@ from core.models import (
     ExerciseType,
     Feedback,
     LearningModule,
+    Meeting,
+    MeetingStatus,
     MockTestTemplate,
     OverallStrategy,
     PronunciationAttempt,
@@ -54,6 +57,7 @@ from core.models import (
     TestFormat,
     TestSection,
     TestSectionExercise,
+    Topic,
     User,
     UserRole,
     UserStatus,
@@ -1664,6 +1668,386 @@ class PronunciationTests(APITransactionTestCase):
             reverse("pronunciation-drill-attempts", args=[self.drill.id]),
             {"audio": big}, format="multipart")
         self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+
+
+class CatalogFilterTests(APITransactionTestCase):
+    """Band/topic grading filters on modules and their exercises."""
+
+    def setUp(self):
+        self.teacher = User.objects.create_user(
+            email="cf@t.app", password="password123", full_name="Teacher",
+            role=UserRole.TEACHER)
+        self.m_low = LearningModule.objects.create(
+            title="Everyday life", band=BandLevel.BAND_5_6, topic=Topic.LIFE,
+            created_by=self.teacher)
+        self.m_high = LearningModule.objects.create(
+            title="Sports science", band=BandLevel.BAND_7_8, topic=Topic.SPORTS,
+            created_by=self.teacher)
+        self.m_untagged = LearningModule.objects.create(
+            title="Untagged", created_by=self.teacher)
+        self.ex_low = Exercise.objects.create(
+            module=self.m_low, title="Daily routine essay",
+            exercise_type=ExerciseType.WRITING, prompt_text="p",
+            band=BandLevel.BAND_5_6, topic=Topic.LIFE)
+        self.ex_high = Exercise.objects.create(
+            module=self.m_low, title="Stretch task",
+            exercise_type=ExerciseType.WRITING, prompt_text="p",
+            band=BandLevel.BAND_7_8, topic=Topic.SPORTS)
+
+    def _login(self, user):
+        resp = self.client.post(reverse("login"), {"email": user.email, "password": "password123"})
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {resp.data['access_token']}")
+
+    def test_module_list_filters(self):
+        self._login(self.teacher)
+        url = reverse("module-list")
+        self.assertEqual(len(self.client.get(url).data), 3)  # unfiltered
+        by_band = self.client.get(url, {"band": BandLevel.BAND_5_6}).data
+        self.assertEqual([m["id"] for m in by_band], [self.m_low.id])
+        by_topic = self.client.get(url, {"topic": Topic.SPORTS}).data
+        self.assertEqual([m["id"] for m in by_topic], [self.m_high.id])
+        both = self.client.get(
+            url, {"band": BandLevel.BAND_7_8, "topic": Topic.LIFE}).data
+        self.assertEqual(both, [])
+        # fields ride on the serializer
+        self.assertEqual(by_band[0]["band"], BandLevel.BAND_5_6)
+        self.assertEqual(by_band[0]["topic"], Topic.LIFE)
+
+    def test_module_exercises_filters(self):
+        self._login(self.teacher)
+        url = reverse("module-exercises", args=[self.m_low.id])
+        self.assertEqual(len(self.client.get(url).data), 2)
+        by_band = self.client.get(url, {"band": BandLevel.BAND_7_8}).data
+        self.assertEqual([e["id"] for e in by_band], [self.ex_high.id])
+        by_topic = self.client.get(url, {"topic": Topic.LIFE}).data
+        self.assertEqual([e["id"] for e in by_topic], [self.ex_low.id])
+
+    def test_catalog_list_is_open_to_students_and_filterable(self):
+        # A standalone catalog item: no module, like seed_exercise_catalog makes.
+        loose = Exercise.objects.create(
+            title="Standalone speaking task", exercise_type=ExerciseType.SPEAKING,
+            prompt_text="Talk about your week.",
+            band=BandLevel.BAND_4_5, topic=Topic.LIFE)
+        student = User.objects.create_user(
+            email="cfs@t.app", password="password123", full_name="Student",
+            role=UserRole.STUDENT)
+        self._login(student)
+        url = reverse("exercise-list")
+
+        self.assertEqual(len(self.client.get(url).data), 3)  # 2 from setUp + loose
+        by_band = self.client.get(url, {"band": BandLevel.BAND_5_6}).data
+        self.assertEqual([e["id"] for e in by_band], [self.ex_low.id])
+        by_topic = self.client.get(url, {"topic": Topic.LIFE}).data
+        self.assertEqual(
+            sorted(e["id"] for e in by_topic), sorted([self.ex_low.id, loose.id]))
+        by_type = self.client.get(url, {"type": ExerciseType.SPEAKING}).data
+        self.assertEqual([e["id"] for e in by_type], [loose.id])
+        by_search = self.client.get(url, {"q": "stretch"}).data
+        self.assertEqual([e["id"] for e in by_search], [self.ex_high.id])
+        combined = self.client.get(
+            url, {"band": BandLevel.BAND_4_5, "topic": Topic.SPORTS}).data
+        self.assertEqual(combined, [])
+
+    def test_catalog_list_never_leaks_the_answer_key(self):
+        question = Question.objects.create(
+            exercise=self.ex_low, text="Which option is right?", order=1)
+        QuestionOption.objects.create(
+            question=question, text="Right", is_correct=True, order=1)
+        QuestionOption.objects.create(
+            question=question, text="Wrong", is_correct=False, order=2)
+        student = User.objects.create_user(
+            email="cfs2@t.app", password="password123", full_name="Student",
+            role=UserRole.STUDENT)
+        self._login(student)
+
+        row = next(
+            e for e in self.client.get(reverse("exercise-list")).data
+            if e["id"] == self.ex_low.id
+        )
+        # Counted, but neither the questions nor their options travel.
+        self.assertEqual(row["question_count"], 1)
+        self.assertNotIn("questions", row)
+        self.assertNotIn("is_correct", json.dumps(row))
+
+    def test_catalog_facets_count_each_dimension_independently(self):
+        student = User.objects.create_user(
+            email="cfs3@t.app", password="password123", full_name="Student",
+            role=UserRole.STUDENT)
+        self._login(student)
+        url = reverse("exercise-facets")
+
+        facets = self.client.get(url).data
+        self.assertEqual(facets["total"], 2)
+        self.assertEqual(facets["bands"][BandLevel.BAND_5_6], 1)
+        self.assertEqual(facets["topics"][Topic.SPORTS], 1)
+        self.assertEqual(facets["types"][ExerciseType.WRITING], 2)
+
+        # With a band selected, `bands` still shows every alternative (so the
+        # student can see what switching would give) while the rest narrow.
+        narrowed = self.client.get(url, {"band": BandLevel.BAND_5_6}).data
+        self.assertEqual(narrowed["total"], 1)
+        self.assertEqual(narrowed["bands"][BandLevel.BAND_7_8], 1)
+        self.assertEqual(narrowed["topics"], {Topic.LIFE: 1})
+
+    def test_exercise_create_accepts_band_topic(self):
+        self._login(self.teacher)
+        resp = self.client.post(
+            reverse("module-exercises", args=[self.m_low.id]),
+            {"title": "New", "exercise_type": ExerciseType.WRITING,
+             "prompt_text": "p", "band": BandLevel.BAND_6_7, "topic": Topic.TRAVEL},
+            format="json")
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.data)
+        self.assertEqual(resp.data["band"], BandLevel.BAND_6_7)
+        self.assertEqual(resp.data["topic"], Topic.TRAVEL)
+        # invalid choice rejected
+        resp = self.client.post(
+            reverse("module-exercises", args=[self.m_low.id]),
+            {"title": "Bad", "exercise_type": ExerciseType.WRITING,
+             "prompt_text": "p", "band": "band_1_2"},
+            format="json")
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+
+
+class MeetingTests(APITransactionTestCase):
+    def setUp(self):
+        cache.clear()  # reset meeting occupancy counters between tests
+        self.admin = User.objects.create_user(
+            email="ma@t.app", password="password123", full_name="Admin",
+            role=UserRole.ADMIN)
+        self.teacher = User.objects.create_user(
+            email="mt@t.app", password="password123", full_name="Teacher",
+            role=UserRole.TEACHER)
+        self.teacher2 = User.objects.create_user(
+            email="mt2@t.app", password="password123", full_name="Teacher Two",
+            role=UserRole.TEACHER)
+        self.student = User.objects.create_user(
+            email="ms@t.app", password="password123", full_name="Student",
+            role=UserRole.STUDENT)
+        self.outsider = User.objects.create_user(
+            email="ms2@t.app", password="password123", full_name="Outsider",
+            role=UserRole.STUDENT)
+        self.klass = Class.objects.create(class_name="M1", teacher=self.teacher)
+        ClassStudent.objects.create(klass=self.klass, student=self.student)
+
+    def _login(self, user):
+        resp = self.client.post(reverse("login"), {"email": user.email, "password": "password123"})
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {resp.data['access_token']}")
+
+    def _create(self):
+        return Meeting.objects.create(
+            klass=self.klass, created_by=self.teacher, title="Office hours")
+
+    def test_create_permissions(self):
+        # student cannot create
+        self._login(self.student)
+        resp = self.client.post(
+            reverse("meeting-list"),
+            {"class_id": self.klass.id, "title": "Nope"}, format="json")
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+        # foreign teacher cannot create for someone else's class
+        self._login(self.teacher2)
+        resp = self.client.post(
+            reverse("meeting-list"),
+            {"class_id": self.klass.id, "title": "Nope"}, format="json")
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+        # owning teacher can; meeting starts active
+        self._login(self.teacher)
+        resp = self.client.post(
+            reverse("meeting-list"),
+            {"class_id": self.klass.id, "title": "Office hours"}, format="json")
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.data)
+        self.assertEqual(resp.data["status"], MeetingStatus.ACTIVE)
+        self.assertEqual(resp.data["created_by"], self.teacher.id)
+        self.assertEqual(resp.data["class_name"], "M1")
+
+    def test_list_scoped_by_enrollment(self):
+        meeting = self._create()
+        self._login(self.student)
+        data = self.client.get(reverse("meeting-list")).data
+        self.assertEqual([m["id"] for m in data], [meeting.id])
+        # a student outside the class sees nothing and cannot retrieve
+        self._login(self.outsider)
+        self.assertEqual(self.client.get(reverse("meeting-list")).data, [])
+        resp = self.client.get(reverse("meeting-detail", args=[meeting.id]))
+        self.assertEqual(resp.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_schedule_meeting(self):
+        self._login(self.teacher)
+        slot = timezone.now() + timezone.timedelta(days=1)
+        resp = self.client.post(
+            reverse("meeting-list"),
+            {"class_id": self.klass.id, "title": "Tomorrow's lesson",
+             "scheduled_at": slot.isoformat()},
+            format="json")
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.data)
+        self.assertEqual(resp.data["status"], MeetingStatus.SCHEDULED)
+        self.assertIsNotNone(resp.data["scheduled_at"])
+        # Not started yet: no clock.
+        self.assertIsNone(resp.data["started_at"])
+        self.assertIsNone(resp.data["duration_seconds"])
+        # The enrolled student sees the booking in their list.
+        self._login(self.student)
+        listed = self.client.get(reverse("meeting-list")).data
+        self.assertIn(resp.data["id"], [m["id"] for m in listed])
+
+    def test_schedule_in_the_past_rejected(self):
+        self._login(self.teacher)
+        resp = self.client.post(
+            reverse("meeting-list"),
+            {"class_id": self.klass.id, "title": "Yesterday",
+             "scheduled_at": (timezone.now() - timezone.timedelta(hours=2)).isoformat()},
+            format="json")
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("scheduled_at", resp.data)
+
+    def test_start_now_meeting_has_no_schedule(self):
+        self._login(self.teacher)
+        resp = self.client.post(
+            reverse("meeting-list"),
+            {"class_id": self.klass.id, "title": "Right now"}, format="json")
+        self.assertEqual(resp.data["status"], MeetingStatus.ACTIVE)
+        self.assertIsNone(resp.data["scheduled_at"])
+
+    def test_joining_starts_the_clock_and_opens_a_scheduled_room(self):
+        meeting = Meeting.objects.create(
+            klass=self.klass, created_by=self.teacher, title="Booked",
+            status=MeetingStatus.SCHEDULED,
+            scheduled_at=timezone.now() + timezone.timedelta(minutes=30))
+
+        async def run():
+            token = str(RefreshToken.for_user(self.student).access_token)
+            comm = WebsocketCommunicator(
+                application, f"ws/meetings/{meeting.id}/?token={token}")
+            connected, _ = await comm.connect()
+            self.assertTrue(connected)
+            ready = await comm.receive_json_from()
+            self.assertEqual(ready["type"], "ready")
+            # The clock origin rides the ready frame so both peers agree.
+            self.assertIsNotNone(ready["started_at"])
+            await comm.disconnect()
+
+        asyncio.run(run())
+        meeting.refresh_from_db()
+        self.assertEqual(meeting.status, MeetingStatus.ACTIVE)
+        self.assertIsNotNone(meeting.started_at)
+        first_started = meeting.started_at
+
+        # A later join must not restart the clock.
+        async def rejoin():
+            token = str(RefreshToken.for_user(self.teacher).access_token)
+            comm = WebsocketCommunicator(
+                application, f"ws/meetings/{meeting.id}/?token={token}")
+            await comm.connect()
+            await comm.receive_json_from()
+            await comm.disconnect()
+
+        asyncio.run(rejoin())
+        meeting.refresh_from_db()
+        self.assertEqual(meeting.started_at, first_started)
+
+    def test_duration_reported_after_end(self):
+        meeting = Meeting.objects.create(
+            klass=self.klass, created_by=self.teacher, title="Timed",
+            started_at=timezone.now() - timezone.timedelta(minutes=5))
+        self._login(self.teacher)
+        resp = self.client.post(reverse("meeting-end", args=[meeting.id]))
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        # ~5 minutes, frozen at end time rather than still counting.
+        self.assertAlmostEqual(resp.data["duration_seconds"], 300, delta=10)
+        again = self.client.get(reverse("meeting-detail", args=[meeting.id]))
+        self.assertEqual(again.data["duration_seconds"], resp.data["duration_seconds"])
+
+    def test_end_meeting(self):
+        meeting = self._create()
+        url = reverse("meeting-end", args=[meeting.id])
+        # student may not end
+        self._login(self.student)
+        self.assertEqual(self.client.post(url).status_code, status.HTTP_403_FORBIDDEN)
+        # foreign teacher: meeting outside their queryset -> 404
+        self._login(self.teacher2)
+        self.assertEqual(self.client.post(url).status_code, status.HTTP_404_NOT_FOUND)
+        # owner ends it; second call is idempotent and keeps ended_at
+        self._login(self.teacher)
+        resp = self.client.post(url)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.data)
+        self.assertEqual(resp.data["status"], MeetingStatus.ENDED)
+        self.assertIsNotNone(resp.data["ended_at"])
+        again = self.client.post(url)
+        self.assertEqual(again.data["ended_at"], resp.data["ended_at"])
+
+    async def _expect_close(self, comm, code):
+        # The signaling consumer accepts BEFORE its checks (so browsers can
+        # read custom close codes); rejections arrive as a post-accept close.
+        connected, _ = await comm.connect()
+        self.assertTrue(connected)
+        event = await comm.receive_output()
+        self.assertEqual(event["type"], "websocket.close")
+        self.assertEqual(event["code"], code)
+
+    def test_signaling_requires_participant_and_live_meeting(self):
+        meeting = self._create()
+
+        async def run():
+            # enrolled student connects fine
+            token = str(RefreshToken.for_user(self.student).access_token)
+            comm = WebsocketCommunicator(
+                application, f"ws/meetings/{meeting.id}/?token={token}")
+            connected, _ = await comm.connect()
+            self.assertTrue(connected)
+            ready = await comm.receive_json_from()
+            self.assertEqual(ready["type"], "ready")
+
+            # teacher joins second; student gets peer_joined, then relayed
+            # offer — every relayed frame is stamped with the sender's sid
+            t_token = str(RefreshToken.for_user(self.teacher).access_token)
+            t_comm = WebsocketCommunicator(
+                application, f"ws/meetings/{meeting.id}/?token={t_token}")
+            t_connected, _ = await t_comm.connect()
+            self.assertTrue(t_connected)
+            await t_comm.receive_json_from()  # teacher's own "ready"
+            joined = await comm.receive_json_from()
+            self.assertEqual(joined["type"], "peer_joined")
+            self.assertEqual(joined["role"], UserRole.TEACHER)
+            self.assertIn("sid", joined)
+            await comm.send_json_to({"type": "offer", "sdp": "fake-sdp"})
+            relayed = await t_comm.receive_json_from()
+            self.assertEqual(relayed["type"], "offer")
+            self.assertEqual(relayed["sdp"], "fake-sdp")
+            self.assertIn("sid", relayed)
+
+            # a non-dict JSON frame is answered, not a crash
+            await comm.send_json_to("ping")
+            err = await comm.receive_json_from()
+            self.assertEqual(err["type"], "error")
+
+            # outsider student is rejected with 4403
+            o_token = str(RefreshToken.for_user(self.outsider).access_token)
+            o_comm = WebsocketCommunicator(
+                application, f"ws/meetings/{meeting.id}/?token={o_token}")
+            await self._expect_close(o_comm, 4403)
+
+            # third authorized participant is refused: the room is 1:1 (4409)
+            a_token = str(RefreshToken.for_user(self.admin).access_token)
+            a_comm = WebsocketCommunicator(
+                application, f"ws/meetings/{meeting.id}/?token={a_token}")
+            await self._expect_close(a_comm, 4409)
+
+            await comm.disconnect()
+            await t_comm.disconnect()
+
+        asyncio.run(run())
+
+        # ended meeting refuses connections with 4404
+        meeting.status = MeetingStatus.ENDED
+        meeting.save(update_fields=["status"])
+
+        async def run_ended():
+            token = str(RefreshToken.for_user(self.student).access_token)
+            comm = WebsocketCommunicator(
+                application, f"ws/meetings/{meeting.id}/?token={token}")
+            await self._expect_close(comm, 4404)
+
+        asyncio.run(run_ended())
 
 
 @override_settings(AI_ASSIST_BACKEND="mock")

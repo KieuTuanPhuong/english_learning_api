@@ -194,6 +194,7 @@ SPECTACULAR_SETTINGS = {
         # another hash-suffixed StatusXxxEnum.
         "AttemptStatusEnum": "core.models.AttemptStatus.choices",
         "SectionStatusEnum": "core.models.SectionStatus.choices",
+        "MeetingStatusEnum": "core.models.MeetingStatus.choices",
         "AiInsightKindEnum": "core.models.AiInsightKind.choices",
     },
     # Bearer JWT — show the Authorize button in Swagger UI.
@@ -217,6 +218,7 @@ SPECTACULAR_SETTINGS = {
         {"name": "rubrics", "description": "Criteria x bands scoring matrices for Writing/Speaking review"},
         {"name": "annotations", "description": "Inline span-anchored teacher notes on writing submissions"},
         {"name": "pronunciation", "description": "Self-serve pronunciation drills: record, score, retry"},
+        {"name": "meetings", "description": "1:1 teacher-student WebRTC meeting rooms (P2P media, WS signaling)"},
     ],
 }
 
