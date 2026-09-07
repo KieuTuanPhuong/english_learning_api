@@ -19,3 +19,10 @@ db.sqlite3
 # IDE
 .vscode/
 .idea/
+
+# Node tooling (the repo carries a yarn.lock for openapi client generation)
+node_modules/
+
+# Local editor / tool caches
+.ruff_cache/
+.DS_Store

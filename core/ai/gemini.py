@@ -75,12 +75,14 @@ def resolve_audio(url_or_path: str) -> tuple[str, bytes]:
     src = str(url_or_path)
     media_url = getattr(settings, "MEDIA_URL", "/media/") or "/media/"
     media_root = Path(getattr(settings, "MEDIA_ROOT", "media"))
-    path = urllib.parse.urlparse(src).path if src.startswith(("http://", "https://")) else src
+    # Always via urlparse: stored links now carry a `?t=<signature>` query
+    # (core/media.py) that must not leak into the filesystem lookup.
+    path = urllib.parse.urlparse(src).path or src
     local = None
     if path.startswith(media_url):
         local = media_root / path[len(media_url):]
-    elif Path(src).is_absolute() or Path(src).exists():
-        local = Path(src)
+    elif Path(path).is_absolute() or Path(path).exists():
+        local = Path(path)
     if local is not None:
         if not local.is_file():
             if src.startswith(("http://", "https://")):

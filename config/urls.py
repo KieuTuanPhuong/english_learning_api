@@ -4,8 +4,6 @@
 /api/    -> DRF browsable API + endpoints
 """
 
-from django.conf import settings
-from django.conf.urls.static import static
 from django.contrib import admin
 from django.http import JsonResponse
 from django.urls import include, path
@@ -19,7 +17,7 @@ from rest_framework.routers import DefaultRouter
 # pyrefly: ignore [missing-import]
 from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
 
-from core import views
+from core import media, views
 
 router = DefaultRouter()
 router.register("users", views.UserViewSet, basename="user")
@@ -91,6 +89,9 @@ docs_patterns = [
 
 urlpatterns = [
     path("", root),
+    # Anonymous, checks the database, exempt from the HTTPS redirect — wire
+    # this into the load balancer and the uptime monitor.
+    path("health/", views.HealthCheckView.as_view(), name="health"),
     path("admin/", admin.site.urls),
     path("api/auth/", include(auth_patterns)),
     path("api/dashboard/", views.DashboardView.as_view(), name="dashboard"),
@@ -102,9 +103,12 @@ urlpatterns = [
     path("api/", include(router.urls)),
 ]
 
-# Dev/MVP media serving for real uploads (pronunciation audio). In production the
-# S3 phase replaces this with presigned GET URLs; local disk serving is fine for
-# MVP (docs/research/04-pronunciation-practice.md §4.2 / risk table). Attempt
-# reads are already scoped to the owning student, so URLs are not discoverable.
-if settings.DEBUG:
-    urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
+# Uploaded audio (pronunciation attempts, mock-test Speaking answers) is served
+# by Django in every environment, not just DEBUG, because it is student voice
+# and must not be a public Nginx alias. Access needs a signed, expiring link
+# (core/media.py, the shape the S3 presigned phase will keep) or an
+# authenticated session. Set MEDIA_X_ACCEL_REDIRECT=true to have Nginx stream
+# the bytes once Django has authorised the request.
+urlpatterns += [
+    path("media/<path:path>", media.ProtectedMediaView.as_view(), name="protected-media"),
+]

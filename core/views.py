@@ -5,6 +5,7 @@ ownership rules mirror the original `require_roles` dependencies.
 """
 
 import csv
+import logging
 
 from django.contrib.auth import authenticate
 from django.core.exceptions import ImproperlyConfigured
@@ -72,7 +73,7 @@ from .permissions import (
     IsActiveUser, IsAdmin, IsStudent, IsTeacherOrAdmin,
     can_view_attempt, can_view_submission_feedback, _teacher_may_annotate,
 )
-from . import mock_tests
+from . import media, mock_tests
 from asgiref.sync import async_to_sync
 from channels.layers import get_channel_layer
 
@@ -85,6 +86,8 @@ from .audio import (
     MOCK_TEST_MAX_UPLOAD_BYTES,
     validate_upload,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class AiUnavailable(APIException):
@@ -1252,6 +1255,57 @@ class AdminActivityView(APIView):
 
 
 @extend_schema(tags=["admin"])
+@extend_schema(tags=["admin"])
+class HealthCheckView(APIView):
+    """Unauthenticated liveness/readiness probe for load balancers and uptime
+    monitors.
+
+    Distinct from :class:`AdminHealthView`, which is admin-only and reports
+    entity counts. This one is anonymous, so it deliberately exposes nothing
+    beyond whether the process can reach its database — and it *does* reach the
+    database, because a probe that only proves the web worker is up will report
+    green through an entire database outage.
+
+    200 when healthy, 503 when not, so an orchestrator can act on the status
+    code alone. `SECURE_REDIRECT_EXEMPT` keeps it reachable over plain HTTP on
+    the private interface.
+    """
+
+    permission_classes = [AllowAny]
+    authentication_classes = []
+
+    @extend_schema(
+        summary="Liveness probe (anonymous): process up + database reachable",
+        responses={
+            200: s.HealthCheckSerializer,
+            503: OpenApiResponse(description="Database unreachable"),
+        },
+    )
+    def get(self, request):
+        import time
+
+        from django.db import connection
+
+        started = time.perf_counter()
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT 1")
+            database, healthy = "ok", True
+        except Exception:
+            # Never surface the driver message: it carries host, port and user.
+            logger.exception("Health check failed to reach the database")
+            database, healthy = "error", False
+
+        return Response(
+            {
+                "status": "ok" if healthy else "degraded",
+                "database": database,
+                "db_latency_ms": round((time.perf_counter() - started) * 1000.0, 2),
+            },
+            status=status.HTTP_200_OK if healthy else status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+
+
 class AdminHealthView(APIView):
     """System health snapshot (read-only, Admin only)."""
 
@@ -1844,7 +1898,12 @@ class AudioUploadView(APIView):
         responses={
             201: inline_serializer(
                 name="AudioUploadResponse",
-                fields={"url": drf_serializers.CharField()},
+                fields={
+                    # Signed, expiring — play this one.
+                    "url": drf_serializers.CharField(),
+                    # Unsigned MEDIA_URL path — persist this one.
+                    "path": drf_serializers.CharField(),
+                },
             ),
             400: OpenApiResponse(description="Missing, oversized, or too-long audio"),
         },
@@ -1867,8 +1926,16 @@ class AudioUploadView(APIView):
         stored = default_storage.save(
             f"mock-tests/{timezone.now():%Y/%m}/{upload.name}", upload
         )
+        # Signed so the clip plays back in an <audio> tag without exposing every
+        # recording to anyone who guesses the filename (core/media.py). The
+        # unsigned path is returned too: that is what callers persist on
+        # Submission.audio_recording_url, and a stored signature would expire.
         return Response(
-            {"url": default_storage.url(stored)}, status=status.HTTP_201_CREATED
+            {
+                "url": media.signed_url(stored, request),
+                "path": default_storage.url(stored),
+            },
+            status=status.HTTP_201_CREATED,
         )
 
     @staticmethod
