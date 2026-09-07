@@ -16,6 +16,7 @@ from channels.testing import WebsocketCommunicator
 from config.asgi import application
 
 from core import mock_tests
+from core import serializers as s_mod
 from core.models import (
     AiInsight,
     AiModel,
@@ -2250,3 +2251,193 @@ class NvidiaProviderTests(APITransactionTestCase):
             resp = self.client.post(f"/api/submissions/{self.sub.id}/ai-explain/")
         self.assertEqual(resp.status_code, 201, resp.data)
         self.assertEqual(resp.data["engine"], "gemini:gemini-3.6-flash")
+
+
+@override_settings(MEDIA_ROOT=tempfile.mkdtemp())
+class ProductionReadinessTests(APITransactionTestCase):
+    """The production surface added for deployment: the anonymous health probe
+    and signed, expiring media links (core/media.py)."""
+
+    def setUp(self):
+        import os
+
+        from django.conf import settings as dj
+
+        self.student = User.objects.create_user(
+            email="pr_s@t.app", password="password123", full_name="S",
+            role=UserRole.STUDENT)
+        self.teacher = User.objects.create_user(
+            email="pr_t@t.app", password="password123", full_name="T",
+            role=UserRole.TEACHER)
+        self.rel = "pronunciation/2026/09/clip.webm"
+        target = os.path.join(dj.MEDIA_ROOT, self.rel)
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with open(target, "wb") as fh:
+            fh.write(b"\x1aE\xdf\xa3audio-bytes")
+
+    def _login(self, user):
+        resp = self.client.post(
+            reverse("login"), {"email": user.email, "password": "password123"})
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {resp.data['access_token']}")
+
+    @staticmethod
+    def _token(url):
+        """The `t` parameter, percent-decoded the way Django decodes it."""
+        from urllib.parse import parse_qs, urlparse
+
+        return parse_qs(urlparse(url).query)["t"][0]
+
+    # ---- health probe ----
+    def test_health_is_anonymous_and_checks_the_database(self):
+        resp = self.client.get("/health/")
+        self.assertEqual(resp.status_code, 200, resp.data)
+        self.assertEqual(resp.data["status"], "ok")
+        self.assertEqual(resp.data["database"], "ok")
+        self.assertGreaterEqual(resp.data["db_latency_ms"], 0)
+        # No auth header was sent: the probe must not be behind IsAuthenticated,
+        # or a load balancer would mark a healthy box as down.
+        self.assertNotIn("counts", resp.data)
+
+    def test_health_reports_503_when_the_database_is_unreachable(self):
+        from unittest import mock
+
+        with mock.patch("django.db.connection.cursor", side_effect=RuntimeError("down")):
+            # Also asserts the failure is logged: with DEBUG off this traceback
+            # is the only record that the probe went red.
+            with self.assertLogs("core.views", level="ERROR"):
+                resp = self.client.get("/health/")
+        self.assertEqual(resp.status_code, 503)
+        self.assertEqual(resp.data["status"], "degraded")
+        self.assertEqual(resp.data["database"], "error")
+        # The driver message names host/port/user — it must not reach an
+        # anonymous caller.
+        self.assertNotIn("down", json.dumps(resp.data))
+
+    # ---- media signing ----
+    def test_sign_unsign_roundtrip_and_url_shape(self):
+        from core import media
+
+        for stored in (
+            self.rel,
+            f"/media/{self.rel}",
+            f"https://api.example.com/media/{self.rel}",
+            f"/media/{self.rel}?t=stale-token",
+        ):
+            self.assertEqual(media.relative_path(stored), self.rel, stored)
+        self.assertEqual(media.relative_path(""), "")
+        self.assertEqual(media.signed_url(""), "")
+        # Absolute URLs pointing somewhere else are not ours to sign.
+        self.assertEqual(media.relative_path("https://cdn.example.com/a.m4a"), "")
+        self.assertEqual(media.signed_url("https://cdn.example.com/a.m4a"), "")
+
+        url = media.signed_url(self.rel)
+        self.assertTrue(url.startswith(f"/media/{self.rel}?t="))
+        self.assertEqual(media.unsign(self._token(url)), self.rel)
+
+    def test_bad_expired_and_foreign_tokens_are_refused(self):
+        from core import media
+
+        token = media.sign(self.rel)
+        with self.assertRaises(media.InvalidMediaToken):
+            media.unsign(token, max_age=-1)          # expired
+        with self.assertRaises(media.InvalidMediaToken):
+            media.unsign(token[:-3] + "aaa")         # tampered
+        with self.assertRaises(media.InvalidMediaToken):
+            media.unsign("")                         # absent
+        # A token minted for another purpose must not open media.
+        from django.core import signing
+        with self.assertRaises(media.InvalidMediaToken):
+            media.unsign(signing.dumps(self.rel, salt="somewhere.else"))
+
+    def test_signed_link_serves_the_file_and_nothing_else_does(self):
+        from core import media
+
+        url = media.signed_url(self.rel)
+        resp = self.client.get(url)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(b"".join(resp.streaming_content), b"\x1aE\xdf\xa3audio-bytes")
+        self.assertIn("private", resp["Cache-Control"])
+
+        # Anonymous, no token.
+        self.assertEqual(self.client.get(f"/media/{self.rel}").status_code, 403)
+        # Token that signs a different file than the path being fetched.
+        other = media.sign("pronunciation/2026/09/someone-else.webm")
+        self.assertEqual(
+            self.client.get(f"/media/{self.rel}?t={other}").status_code, 403)
+        # A JWT is not enough on its own: <audio> cannot send one, so the only
+        # header-based caller is a script, and it should mint a signed link.
+        self._login(self.student)
+        self.assertEqual(self.client.get(f"/media/{self.rel}").status_code, 403)
+
+    def test_session_user_may_browse_media_and_traversal_is_blocked(self):
+        # Django admin links are plain hrefs from a logged-in session.
+        self.client.force_login(self.teacher)
+        self.assertEqual(self.client.get(f"/media/{self.rel}").status_code, 200)
+        for attack in ("../../etc/passwd", "..%2f..%2fetc%2fpasswd"):
+            resp = self.client.get(f"/media/{attack}")
+            self.assertIn(resp.status_code, (403, 404), attack)
+
+    def test_x_accel_redirect_hands_streaming_to_nginx(self):
+        from core import media
+
+        url = media.signed_url(self.rel)
+        with override_settings(MEDIA_X_ACCEL_REDIRECT=True,
+                               MEDIA_X_ACCEL_PREFIX="/protected-media/"):
+            resp = self.client.get(url)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp["X-Accel-Redirect"], f"/protected-media/{self.rel}")
+        self.assertEqual(resp.content, b"")
+
+    # ---- serializers hand out signed links ----
+    def test_serializers_emit_signed_media_urls(self):
+        from core import media
+
+        drill = PronunciationDrill.objects.create(
+            target_text="ship", drill_type=DrillType.WORD, created_by=self.teacher)
+        attempt = PronunciationAttempt.objects.create(
+            drill=drill, student=self.student,
+            audio_file=SimpleUploadedFile("a.webm", b"x", content_type="audio/webm"))
+        data = s_mod.PronunciationAttemptSerializer(attempt).data
+        self.assertIn("?t=", data["audio_url"])
+        self.assertEqual(
+            media.unsign(self._token(data["audio_url"])), attempt.audio_file.name)
+
+        exercise = Exercise.objects.create(
+            title="S", exercise_type=ExerciseType.SPEAKING, prompt_text="Talk.",
+            created_by=self.teacher)
+        submission = Submission.objects.create(
+            exercise=exercise, student=self.student,
+            submission_type=SubmissionType.SPEAKING,
+            audio_recording_url=f"/media/{self.rel}")
+        data = s_mod.SubmissionSerializer(submission).data
+        # The raw stored value is untouched; the playable one is signed.
+        self.assertEqual(data["audio_recording_url"], f"/media/{self.rel}")
+        self.assertIn("?t=", data["audio_url"])
+        # An external URL we never stored passes straight through.
+        submission.audio_recording_url = "https://cdn.example.com/a.m4a"
+        self.assertEqual(
+            s_mod.SubmissionSerializer(submission).data["audio_url"],
+            "https://cdn.example.com/a.m4a")
+
+    def test_ai_layer_still_resolves_a_signed_url_to_bytes(self):
+        from core.ai.gemini import resolve_audio
+
+        mime, data = resolve_audio(f"/media/{self.rel}?t=whatever")
+        self.assertEqual(mime, "audio/webm")
+        self.assertEqual(data, b"\x1aE\xdf\xa3audio-bytes")
+
+    # ---- settings helpers ----
+    def test_env_helpers_parse_config(self):
+        import os
+        from unittest import mock
+
+        from config.settings import env_bool, env_list
+
+        with mock.patch.dict(os.environ, {"X": "TRUE"}, clear=False):
+            self.assertTrue(env_bool("X", False))
+        for value in ("false", "0", "no", "off", "  "):
+            with mock.patch.dict(os.environ, {"X": value}, clear=False):
+                self.assertEqual(env_bool("X", value.strip() == ""), value.strip() == "")
+        with mock.patch.dict(os.environ, {"H": " a.com , ,b.com "}, clear=False):
+            self.assertEqual(env_list("H"), ["a.com", "b.com"])
+        self.assertEqual(env_list("DEFINITELY_UNSET_VAR_NAME"), [])

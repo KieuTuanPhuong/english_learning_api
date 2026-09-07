@@ -13,7 +13,7 @@ from django.utils import timezone
 from drf_spectacular.utils import extend_schema_field
 from rest_framework import serializers
 
-from . import mock_tests
+from . import media, mock_tests
 from .models import (
     AiInsight,
     Assignment,
@@ -257,6 +257,20 @@ class AssignmentSerializer(serializers.ModelSerializer):
 
 # ---------- Submission ----------
 class SubmissionSerializer(serializers.ModelSerializer):
+    # `audio_recording_url` stays the raw stored value (the client writes it on
+    # create). `audio_url` is the playable, signed form of the same file —
+    # clients should render this one.
+    audio_url = serializers.SerializerMethodField()
+
+    @extend_schema_field(serializers.CharField(allow_null=True))
+    def get_audio_url(self, obj):
+        if not obj.audio_recording_url:
+            return None
+        return (
+            media.signed_url(obj.audio_recording_url, self.context.get("request"))
+            or obj.audio_recording_url  # external URL we did not store: pass through
+        )
+
     exercise_id = serializers.PrimaryKeyRelatedField(
         source="exercise", queryset=Exercise.objects.all()
     )
@@ -272,8 +286,11 @@ class SubmissionSerializer(serializers.ModelSerializer):
             "id", "exercise_id", "assignment_id", "submission_type",
             "writing_text", "audio_recording_url",
             "answers", "auto_score", "status", "student_id", "submitted_at",
+            "audio_url",
         ]
-        read_only_fields = ["id", "student_id", "auto_score", "status", "submitted_at"]
+        read_only_fields = [
+            "id", "student_id", "auto_score", "status", "submitted_at", "audio_url",
+        ]
 
 
 # ---------- Feedback + rubric criterion scores (docs/research/02-scoring-rubrics.md) ----------
@@ -595,6 +612,14 @@ class ActivityItemSerializer(serializers.Serializer):
     id = serializers.IntegerField()
     summary = serializers.CharField()
     timestamp = serializers.DateTimeField()
+
+
+class HealthCheckSerializer(serializers.Serializer):
+    """Anonymous liveness probe payload — see HealthCheckView."""
+
+    status = serializers.CharField()        # "ok" | "degraded"
+    database = serializers.CharField()      # "ok" | "error"
+    db_latency_ms = serializers.FloatField()
 
 
 class HealthSerializer(serializers.Serializer):
@@ -1168,11 +1193,11 @@ class PronunciationAttemptSerializer(serializers.ModelSerializer):
 
     @extend_schema_field(serializers.CharField(allow_null=True))
     def get_audio_url(self, obj):
+        """Short-lived signed link (core/media.py). Plays in an <audio> tag,
+        which cannot send an Authorization header, and expires afterwards."""
         if not obj.audio_file:
             return None
-        url = obj.audio_file.url
-        request = self.context.get("request")
-        return request.build_absolute_uri(url) if request else url
+        return media.signed_url(obj.audio_file.name, self.context.get("request")) or None
 
 
 class PronunciationAttemptCreateSerializer(serializers.Serializer):

@@ -1,11 +1,29 @@
+# Runtime dependencies. Pinned exactly so a deploy installs what CI tested.
+# Python 3.12.
+
+# --- Framework ---
 Django==5.1.15
 djangorestframework==3.15.2
 djangorestframework-simplejwt==5.3.1
-drf-spectacular==0.28.0
 PyJWT==2.13.0
-psycopg2-binary==2.9.10
-python-dotenv==1.0.1
+drf-spectacular==0.28.0
 django-cors-headers==4.6.0
-channels==4.2.0
-channels-redis==4.2.1
+
+# --- ASGI server + WebSockets ---
+# Daphne serves HTTP and WebSocket from one process (config/asgi.py).
 daphne==4.1.2
+channels==4.2.0
+# Redis channel layer: required whenever more than one worker process runs,
+# otherwise WebSocket broadcasts do not cross processes (REDIS_URL in .env).
+channels-redis==4.2.1
+
+# --- Database ---
+psycopg2-binary==2.9.10
+
+# --- Static files ---
+# Serves collectstatic output from the app process, so the admin renders
+# without an Nginx alias into the deploy user's home directory.
+whitenoise[brotli]==6.12.0
+
+# --- Config ---
+python-dotenv==1.0.1
