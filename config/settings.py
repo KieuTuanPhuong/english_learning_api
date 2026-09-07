@@ -194,9 +194,9 @@ DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 MEDIA_ROOT = os.getenv("MEDIA_ROOT") or (BASE_DIR / "media")
 MEDIA_URL = "/media/"
 
-# AI grading integration settings: "mock" (deterministic), "gemini" (live via
-# GEMINI_API_KEY — writing rubric grading + speaking transcription/scoring),
-# "real" (legacy stub, raises).
+# AI grading integration settings: "mock" (deterministic), "llm" (alias
+# "gemini": live — writing graded by AI_GRADING_MODEL, speaking transcribed +
+# scored by Gemini), "real" (legacy stub, raises).
 AI_BACKEND = os.getenv("AI_BACKEND", "mock").lower()
 
 # AI coaching assistants (teacher-feedback review, student mistake explanation;
@@ -204,8 +204,18 @@ AI_BACKEND = os.getenv("AI_BACKEND", "mock").lower()
 # call via GEMINI_API_KEY. Defaults to gemini only when a key is present.
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
+# NVIDIA NIM (build.nvidia.com), OpenAI-compatible; hosts Kimi K3 / DeepSeek V4.
+NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY", "")
+NVIDIA_MODEL = os.getenv("NVIDIA_MODEL", "moonshotai/kimi-k3")
+NVIDIA_TIMEOUT = float(os.getenv("NVIDIA_TIMEOUT", "600"))  # per-read socket timeout (NIM queues 3-5 min)
+NVIDIA_THINKING = os.getenv("NVIDIA_THINKING", "false").lower() == "true"  # keep reasoning pass on
+# Text-task routing (core/ai/llm.py): "provider[:model]". Audio always -> Gemini.
+AI_TEXT_PROVIDER = os.getenv("AI_TEXT_PROVIDER", "gemini" if GEMINI_API_KEY else "nvidia").lower()
+AI_GRADING_MODEL = os.getenv("AI_GRADING_MODEL", "")   # e.g. nvidia:moonshotai/kimi-k3
+AI_ASSIST_MODEL = os.getenv("AI_ASSIST_MODEL", "")     # e.g. nvidia:deepseek-ai/deepseek-v4-pro-0813
+AI_FALLBACK_PROVIDER = os.getenv("AI_FALLBACK_PROVIDER", "gemini" if GEMINI_API_KEY else "").lower()
 AI_ASSIST_BACKEND = (
-    os.getenv("AI_ASSIST_BACKEND") or ("gemini" if GEMINI_API_KEY else "mock")
+    os.getenv("AI_ASSIST_BACKEND") or ("llm" if (GEMINI_API_KEY or NVIDIA_API_KEY) else "mock")
 ).lower()
 
 # Pronunciation-assessment engine switch (sibling of AI_BACKEND). "mock"
@@ -219,6 +229,8 @@ PRONUNCIATION_BACKEND = os.getenv("PRONUNCIATION_BACKEND", "mock").lower()
 # tests opt back in with override_settings(...="gemini") + a patched client.
 if len(sys.argv) > 1 and sys.argv[1] == "test":
     AI_BACKEND = PRONUNCIATION_BACKEND = AI_ASSIST_BACKEND = "mock"
+    AI_TEXT_PROVIDER = "gemini"
+    AI_GRADING_MODEL = AI_ASSIST_MODEL = AI_FALLBACK_PROVIDER = ""
 
 # Reports — PDF export is deferred behind reportlab; CSV is always available.
 REPORTS_PDF_ENABLED = os.getenv("REPORTS_PDF_ENABLED", "false").lower() == "true"

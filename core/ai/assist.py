@@ -10,8 +10,10 @@ Two features, both read-only over existing data:
    the result as an ``AiInsight`` row so re-opening the page is free.
 
 Backend switch mirrors ``core/ai/backends.py``: ``AI_ASSIST_BACKEND=mock``
-(deterministic, offline — the test default) or ``gemini`` (live call through
-``core/ai/gemini.py``). Both backends receive the same context dict built by
+(deterministic, offline — the test default) or ``llm`` (alias ``gemini``): a
+live call to the provider/model in ``AI_ASSIST_MODEL`` via ``core/ai/llm.py``
+(Gemini, or NVIDIA-hosted Kimi K3 / DeepSeek V4). Speaking transcription
+always uses Gemini. Both backends receive the same context dict built by
 ``build_context``; the model never sees raw ORM objects.
 """
 
@@ -31,7 +33,7 @@ from ..models import (
     normalize_answers,
     strip_blank_answers,
 )
-from . import gemini
+from . import gemini, llm
 
 _MAX_TEXT = 6000  # chars of student text sent to the model
 
@@ -148,9 +150,9 @@ def _speaking_transcript(submission) -> str | None:
     prior = submission.ai_insights.filter(payload__has_key="transcript").first()
     if prior is not None:
         return prior.payload.get("transcript")
-    if get_assist_backend().name != "gemini":
+    if get_assist_backend().name != "llm":
         return None
-    return gemini.transcribe(submission.audio_recording_url)
+    return gemini.transcribe(submission.audio_recording_url)  # audio -> Gemini only
 
 
 def build_context(submission) -> dict:
@@ -334,8 +336,8 @@ _MISTAKES_SYSTEM = textwrap.dedent("""
 """).strip()
 
 
-class GeminiAssistBackend(BaseAssistBackend):
-    name = "gemini"
+class LlmAssistBackend(BaseAssistBackend):
+    name = "llm"
 
     def review_feedback(self, ctx, draft):
         user = (
@@ -344,27 +346,34 @@ class GeminiAssistBackend(BaseAssistBackend):
             + "\n\nTEACHER'S FEEDBACK TO REVIEW (JSON):\n"
             + json.dumps(draft, ensure_ascii=False, indent=1)
         )
-        data = gemini.generate_json(
-            system=_REVIEW_SYSTEM, user=user, schema=REVIEW_SCHEMA, temperature=0.3,
+        data = llm.generate_json(
+            "assist", system=_REVIEW_SYSTEM, user=user, schema=REVIEW_SCHEMA,
+            temperature=0.3,
         )
-        data["rating"] = max(1, min(5, int(data.get("rating") or 3)))
+        try:
+            data["rating"] = max(1, min(5, int(data.get("rating") or 3)))
+        except (TypeError, ValueError):
+            data["rating"] = 3
         return data
 
     def explain_mistakes(self, ctx):
         user = "STUDENT SUBMISSION (JSON):\n" + json.dumps(ctx, ensure_ascii=False, indent=1)
-        return gemini.generate_json(
-            system=_MISTAKES_SYSTEM, user=user, schema=MISTAKES_SCHEMA, temperature=0.2,
+        return llm.generate_json(
+            "assist", system=_MISTAKES_SYSTEM, user=user, schema=MISTAKES_SCHEMA,
+            temperature=0.2,
         )
 
 
 def get_assist_backend() -> BaseAssistBackend:
     name = getattr(settings, "AI_ASSIST_BACKEND", "mock")
-    return GeminiAssistBackend() if name == "gemini" else MockAssistBackend()
+    return LlmAssistBackend() if name in ("llm", "gemini") else MockAssistBackend()
 
 
 def engine_label() -> str:
-    backend = get_assist_backend()
-    return f"gemini:{gemini.model_name()}" if backend.name == "gemini" else "mock"
+    return llm.label("assist") if get_assist_backend().name == "llm" else "mock"
+
+
+GeminiAssistBackend = LlmAssistBackend  # backwards-compatible name
 
 
 # --------------------------------------------------------------- public API
@@ -391,7 +400,7 @@ def review_feedback(submission, *, score=None, comments="", criterion_scores=Non
             for row in criterion_scores
         ]
     result = get_assist_backend().review_feedback(ctx, draft)
-    result["engine"] = engine_label()
+    result.setdefault("engine", engine_label())
     return result
 
 
@@ -401,10 +410,10 @@ def explain_mistakes(submission) -> dict:
     if submission.submission_type == SubmissionType.SPEAKING:
         if not submission.audio_recording_url:
             raise ValueError("This speaking submission has no recording to analyse.")
-        if get_assist_backend().name != "gemini":
+        if get_assist_backend().name != "llm":
             raise ValueError(
-                "Mistake explanation for speaking needs the Gemini backend "
-                "(AI_ASSIST_BACKEND=gemini) to transcribe the recording."
+                "Mistake explanation for speaking needs a live backend "
+                "(AI_ASSIST_BACKEND=llm) to transcribe the recording."
             )
     if submission.submission_type == SubmissionType.WRITING and not (submission.writing_text or "").strip():
         raise ValueError("This writing submission has no text to analyse.")
@@ -412,7 +421,7 @@ def explain_mistakes(submission) -> dict:
         raise ValueError("This submission has no answers to analyse.")
     ctx = build_context(submission)
     result = get_assist_backend().explain_mistakes(ctx)
-    result["engine"] = engine_label()
+    result.setdefault("engine", engine_label())
     if ctx.get("transcript"):
         result["transcript"] = ctx["transcript"]
     return result

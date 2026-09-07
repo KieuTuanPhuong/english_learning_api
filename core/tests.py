@@ -2045,3 +2045,208 @@ class GeminiBackendTests(APITransactionTestCase):
             self.assertEqual(self.client.post(url).status_code, 201)
         tr.assert_called_once()
         tr2.assert_not_called()
+
+
+class NvidiaProviderTests(APITransactionTestCase):
+    """NVIDIA NIM client (OpenAI-compatible) + provider dispatcher, offline."""
+
+    def setUp(self):
+        self.teacher = User.objects.create_user(
+            email="nt@t.app", password="password123", full_name="T", role=UserRole.TEACHER)
+        self.student = User.objects.create_user(
+            email="ns@t.app", password="password123", full_name="S", role=UserRole.STUDENT)
+        ex = Exercise.objects.create(
+            title="W", exercise_type=ExerciseType.WRITING, prompt_text="Write.",
+            created_by=self.teacher)
+        self.sub = Submission.objects.create(
+            exercise=ex, student=self.student, submission_type=SubmissionType.WRITING,
+            writing_text="I goes home.")
+
+    def _login(self, user):
+        resp = self.client.post(reverse("login"), {"email": user.email, "password": "password123"})
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {resp.data['access_token']}")
+
+    def test_extract_json_tolerates_fences_prose_and_think_blocks(self):
+        from core.ai.nvidia import extract_json
+        self.assertEqual(extract_json('```json\n{"a": 1}\n```')["a"], 1)
+        self.assertEqual(extract_json('<think>hmm {not json}</think>\nSure: {"a": 2} done')["a"], 2)
+        self.assertEqual(extract_json('{"a": {"b": [1, 2]}}')["a"]["b"], [1, 2])
+        from core.ai.gemini import GeminiError
+        with self.assertRaises(GeminiError):
+            extract_json("no json here")
+        with self.assertRaises(GeminiError):
+            extract_json("[1, 2]")
+
+    def test_parse_response_shapes(self):
+        from core.ai import nvidia
+        from core.ai.gemini import GeminiError
+        ok = {"choices": [{"message": {"content": '{"x": true}'}, "finish_reason": "stop"}]}
+        self.assertTrue(nvidia.parse_response(json.dumps(ok))["x"])
+        with self.assertRaises(GeminiError):
+            nvidia.parse_response(json.dumps({"error": {"message": "bad key"}}))
+        with self.assertRaises(GeminiError):
+            nvidia.parse_response(json.dumps({"detail": "Not found", "status": 404}))
+        with self.assertRaises(GeminiError):
+            nvidia.parse_response(json.dumps({"choices": [{"message": {"content": ""}, "finish_reason": "length"}]}))
+
+    def test_schema_hint_renders_shape(self):
+        from core.ai.nvidia import _schema_hint
+        from core.ai.assist import MISTAKES_SCHEMA
+        hint = _schema_hint(MISTAKES_SCHEMA)
+        self.assertIn('"mistakes": [', hint)
+        self.assertIn("grammar | vocabulary", hint)
+        self.assertIn("required: summary, mistakes", hint)
+
+    def test_resolve_routes_by_task_and_forces_gemini_for_audio(self):
+        from core.ai import llm
+        with override_settings(
+            AI_GRADING_MODEL="nvidia:moonshotai/kimi-k3",
+            AI_ASSIST_MODEL="nvidia", NVIDIA_MODEL="deepseek-ai/deepseek-v4-flash-0731",
+            AI_TEXT_PROVIDER="gemini", GEMINI_MODEL="gemini-3.6-flash",
+        ):
+            self.assertEqual(llm.resolve("grading"), ("nvidia", "moonshotai/kimi-k3"))
+            self.assertEqual(llm.resolve("assist"), ("nvidia", "deepseek-ai/deepseek-v4-flash-0731"))
+            self.assertEqual(llm.resolve("grading", audio=True), ("gemini", "gemini-3.6-flash"))
+            self.assertEqual(llm.label("assist"), "nvidia:deepseek-ai/deepseek-v4-flash-0731")
+        with override_settings(AI_GRADING_MODEL="", AI_TEXT_PROVIDER="gemini"):
+            self.assertEqual(llm.resolve("grading")[0], "gemini")
+        with override_settings(AI_GRADING_MODEL="openai:gpt"):
+            with self.assertRaises(ValueError):
+                llm.resolve("grading")
+
+    def test_nvidia_generate_json_builds_openai_request(self):
+        from unittest import mock
+        from core.ai import nvidia
+        captured = {}
+
+        class FakeResp:
+            def __init__(self, body): self.body = body
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def __iter__(self): return iter(self.body.split(b"\n"))
+
+        def sse(*chunks):
+            lines = [("data: " + json.dumps(c)).encode() for c in chunks] + [b"data: [DONE]"]
+            return b"\n\n".join(lines)
+
+        def fake_open(req, timeout=None):
+            captured["url"] = req.full_url
+            captured["auth"] = req.get_header("Authorization")
+            captured["body"] = json.loads(req.data)
+            return FakeResp(sse(
+                {"choices": [{"delta": {"role": "assistant", "reasoning_content": "thinking..."}}]},
+                {"choices": [{"delta": {"content": "```json\n{\"summary\": \"s\", "}}]},
+                {"choices": [{"delta": {"content": "\"mistakes\": [], \"strengths\": [], \"practice_suggestions\": []}\n```"}, "finish_reason": "stop"}]},
+            ))
+
+        with override_settings(NVIDIA_API_KEY="nv-k"), mock.patch(
+            "core.ai.nvidia.urllib.request.urlopen", side_effect=fake_open):
+            out = nvidia.generate_json(
+                system="SYS", user="USER", schema={"type": "OBJECT", "properties": {
+                    "summary": {"type": "STRING"}}, "required": ["summary"]},
+                model="moonshotai/kimi-k3")
+        self.assertEqual(out["summary"], "s")
+        self.assertTrue(captured["url"].endswith("/v1/chat/completions"))
+        self.assertEqual(captured["auth"], "Bearer nv-k")
+        self.assertEqual(captured["body"]["model"], "moonshotai/kimi-k3")
+        self.assertTrue(captured["body"]["stream"])
+        self.assertEqual(captured["body"]["chat_template_kwargs"], {"thinking": False})
+        self.assertEqual(captured["body"]["messages"][1], {"role": "user", "content": "USER"})
+        self.assertTrue(captured["body"]["messages"][0]["content"].startswith("SYS"))
+        self.assertIn("Respond with ONE JSON object", captured["body"]["messages"][0]["content"])
+        with self.assertRaises(ValueError):
+            nvidia.generate_json(system="s", user="u", schema={}, audio=("audio/webm", b"x"))
+        from django.core.exceptions import ImproperlyConfigured
+        with override_settings(NVIDIA_API_KEY=""):
+            with self.assertRaises(ImproperlyConfigured):
+                nvidia.generate_json(system="s", user="u", schema={})
+
+    def test_grading_and_assist_route_to_nvidia_models(self):
+        from unittest import mock
+        self._login(self.teacher)
+        grade = {"score": 61, "comments": "Fix verbs.", "criteria": []}
+        with override_settings(
+            AI_BACKEND="llm", AI_GRADING_MODEL="nvidia:moonshotai/kimi-k3", NVIDIA_API_KEY="k",
+        ), mock.patch("core.ai.llm.nvidia.generate_json", return_value=grade) as nv, mock.patch(
+            "core.ai.llm.gemini.generate_json") as gm:
+            resp = self.client.post(f"/api/submissions/{self.sub.id}/ai-evaluate/")
+        self.assertEqual(resp.status_code, 201, resp.data)
+        self.assertEqual(resp.data["score"], "61.00")
+        self.assertIn("[AI · nvidia:moonshotai/kimi-k3]", resp.data["comments"])
+        self.assertEqual(nv.call_args.kwargs["model"], "moonshotai/kimi-k3")
+        gm.assert_not_called()
+
+        self._login(self.student)
+        explain = {"summary": "s", "mistakes": [], "strengths": [], "practice_suggestions": []}
+        with override_settings(
+            AI_ASSIST_BACKEND="llm", AI_ASSIST_MODEL="nvidia:deepseek-ai/deepseek-v4-flash-0731",
+            NVIDIA_API_KEY="k",
+        ), mock.patch("core.ai.llm.nvidia.generate_json", return_value=explain) as nv:
+            resp = self.client.post(f"/api/submissions/{self.sub.id}/ai-explain/")
+        self.assertEqual(resp.status_code, 201, resp.data)
+        self.assertEqual(resp.data["engine"], "nvidia:deepseek-ai/deepseek-v4-flash-0731")
+        self.assertEqual(nv.call_args.kwargs["model"], "deepseek-ai/deepseek-v4-flash-0731")
+
+    def test_speaking_still_uses_gemini_when_text_routed_to_nvidia(self):
+        from unittest import mock
+        import os, tempfile
+        from django.conf import settings as dj
+        media = tempfile.mkdtemp()
+        os.makedirs(os.path.join(media, "mock-tests"))
+        with open(os.path.join(media, "mock-tests", "a.webm"), "wb") as fh:
+            fh.write(b"\x1aE\xdf\xa3x")
+        ex = Exercise.objects.create(
+            title="S", exercise_type=ExerciseType.SPEAKING, prompt_text="Talk.",
+            created_by=self.teacher)
+        sub = Submission.objects.create(
+            exercise=ex, student=self.student, submission_type=SubmissionType.SPEAKING,
+            audio_recording_url="/media/mock-tests/a.webm")
+        self._login(self.teacher)
+        spoken = {"transcript": "hi", "score": 40, "comments": "c", "criteria": []}
+        with override_settings(
+            MEDIA_ROOT=media, AI_BACKEND="llm", AI_GRADING_MODEL="nvidia:moonshotai/kimi-k3",
+            GEMINI_API_KEY="g", NVIDIA_API_KEY="k",
+        ), mock.patch("core.ai.llm.gemini.generate_json", return_value=spoken) as gm, mock.patch(
+            "core.ai.llm.nvidia.generate_json") as nv:
+            resp = self.client.post(f"/api/submissions/{sub.id}/ai-evaluate/")
+        self.assertEqual(resp.status_code, 201, resp.data)
+        self.assertIn("[AI · gemini:", resp.data["comments"])
+        self.assertEqual(gm.call_args.kwargs["audio"][0], "audio/webm")
+        nv.assert_not_called()
+
+
+    def test_fallback_provider_when_nvidia_fails(self):
+        from unittest import mock
+        from core.ai.gemini import GeminiError
+        self._login(self.teacher)
+        grade = {"score": 58, "comments": "ok", "criteria": []}
+        with override_settings(
+            AI_BACKEND="llm", AI_GRADING_MODEL="nvidia:moonshotai/kimi-k3",
+            AI_FALLBACK_PROVIDER="gemini", NVIDIA_API_KEY="k", GEMINI_API_KEY="g",
+            GEMINI_MODEL="gemini-3.6-flash",
+        ), mock.patch("core.ai.llm.nvidia.generate_json", side_effect=GeminiError("504")) as nv, mock.patch(
+            "core.ai.llm.gemini.generate_json", return_value=dict(grade)) as gm:
+            resp = self.client.post(f"/api/submissions/{self.sub.id}/ai-evaluate/")
+        self.assertEqual(resp.status_code, 201, resp.data)
+        self.assertIn("[AI · gemini:gemini-3.6-flash]", resp.data["comments"])
+        nv.assert_called_once()
+        gm.assert_called_once()
+        # No fallback configured -> the NIM failure surfaces as 502.
+        with override_settings(
+            AI_BACKEND="llm", AI_GRADING_MODEL="nvidia:moonshotai/kimi-k3",
+            AI_FALLBACK_PROVIDER="", NVIDIA_API_KEY="k",
+        ), mock.patch("core.ai.llm.nvidia.generate_json", side_effect=GeminiError("504")):
+            self.assertEqual(
+                self.client.post(f"/api/submissions/{self.sub.id}/ai-evaluate/").status_code, 502)
+        # Assist reports the engine that actually answered.
+        self._login(self.student)
+        explain = {"summary": "s", "mistakes": [], "strengths": [], "practice_suggestions": []}
+        with override_settings(
+            AI_ASSIST_BACKEND="llm", AI_ASSIST_MODEL="nvidia:deepseek-ai/deepseek-v4-pro-0813",
+            AI_FALLBACK_PROVIDER="gemini", NVIDIA_API_KEY="k", GEMINI_API_KEY="g",
+            GEMINI_MODEL="gemini-3.6-flash",
+        ), mock.patch("core.ai.llm.nvidia.generate_json", side_effect=GeminiError("504")), mock.patch(
+            "core.ai.llm.gemini.generate_json", return_value=dict(explain)):
+            resp = self.client.post(f"/api/submissions/{self.sub.id}/ai-explain/")
+        self.assertEqual(resp.status_code, 201, resp.data)
+        self.assertEqual(resp.data["engine"], "gemini:gemini-3.6-flash")

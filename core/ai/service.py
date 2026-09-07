@@ -16,7 +16,7 @@ from ..models import (
     Feedback,
     SubmissionStatus,
 )
-from .backends import GeminiBackend, MockBackend, RealBackend
+from .backends import LlmBackend, MockBackend, RealBackend
 
 _AUDIO = {ExerciseType.SPEAKING, ExerciseType.LISTENING}
 
@@ -26,8 +26,8 @@ def get_backend():
     AiModel row so it can read endpoint_url + strictness."""
     name = getattr(settings, "AI_BACKEND", "mock")
     ai_model = AiModel.active()
-    if name == "gemini":
-        return GeminiBackend(ai_model)
+    if name in ("llm", "gemini"):
+        return LlmBackend(ai_model)
     return RealBackend(ai_model) if name == "real" else MockBackend(ai_model)
 
 
