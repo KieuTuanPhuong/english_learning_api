@@ -18,6 +18,7 @@ from .models import (
     Feedback,
     LearningModule,
     LessonPlan,
+    Meeting,
     MockTestTemplate,
     PronunciationAttempt,
     PronunciationDrill,
@@ -138,8 +139,8 @@ class ExerciseInline(admin.TabularInline):
 
 @admin.register(LearningModule)
 class LearningModuleAdmin(admin.ModelAdmin):
-    list_display = ("id", "title", "difficulty_level", "created_by", "created_at")
-    list_filter = ("difficulty_level",)
+    list_display = ("id", "title", "difficulty_level", "band", "topic", "created_by", "created_at")
+    list_filter = ("difficulty_level", "band", "topic")
     search_fields = ("title",)
     raw_id_fields = ("created_by",)
     inlines = [ExerciseInline]
@@ -152,8 +153,8 @@ class QuestionInline(admin.TabularInline):
 
 @admin.register(Exercise)
 class ExerciseAdmin(admin.ModelAdmin):
-    list_display = ("id", "title", "exercise_type", "module", "created_by", "created_at")
-    list_filter = ("exercise_type",)
+    list_display = ("id", "title", "exercise_type", "band", "topic", "module", "created_by", "created_at")
+    list_filter = ("exercise_type", "band", "topic")
     search_fields = ("title", "prompt_text", "content_text")
     raw_id_fields = ("module", "created_by")
     inlines = [QuestionInline]
@@ -400,6 +401,18 @@ class PronunciationAttemptAdmin(admin.ModelAdmin):
         "completeness_score", "prosody_score", "word_results",
         "engine", "engine_metadata", "created_at",
     )
+
+
+# ---------- Meetings ----------
+@admin.register(Meeting)
+class MeetingAdmin(admin.ModelAdmin):
+    list_display = (
+        "id", "title", "klass", "status", "scheduled_at",
+        "started_at", "ended_at", "created_by", "created_at",
+    )
+    list_filter = ("status",)
+    search_fields = ("title",)
+    raw_id_fields = ("klass", "created_by")
 
 
 @admin.register(AiInsight)

@@ -8,6 +8,7 @@ import csv
 import logging
 
 from django.contrib.auth import authenticate
+from django.core.cache import cache
 from django.core.exceptions import ImproperlyConfigured
 from django.core.files.storage import default_storage
 from django.db.models import Count, ProtectedError, Q
@@ -44,12 +45,16 @@ from .models import (
     AiInsight,
     AiInsightKind,
     Assignment,
+    BandLevel,
     Class,
     ClassStudent,
     Exercise,
+    ExerciseType,
     Feedback,
     LearningModule,
     LessonPlan,
+    Meeting,
+    MeetingStatus,
     MockTestTemplate,
     PronunciationAttempt,
     PronunciationDrill,
@@ -62,6 +67,7 @@ from .models import (
     TestAttempt,
     TestFormat,
     TestSectionExercise,
+    Topic,
     User,
     UserRole,
     WritingAnnotation,
@@ -462,6 +468,35 @@ class ModuleViewSet(viewsets.ModelViewSet):
     queryset = LearningModule.objects.all().order_by("id")
     serializer_class = s.LearningModuleSerializer
 
+    def get_queryset(self):
+        qs = LearningModule.objects.all().order_by("id")
+        if self.action == "list":
+            band = self.request.query_params.get("band")
+            topic = self.request.query_params.get("topic")
+            if band:
+                qs = qs.filter(band=band)
+            if topic:
+                qs = qs.filter(topic=topic)
+        return qs
+
+    @extend_schema(
+        summary="List modules, filterable by band and topic",
+        parameters=[
+            OpenApiParameter(
+                "band", OpenApiTypes.STR, OpenApiParameter.QUERY,
+                description="Filter by target band range (e.g. band_5_6)",
+                enum=[c[0] for c in BandLevel.choices],
+            ),
+            OpenApiParameter(
+                "topic", OpenApiTypes.STR, OpenApiParameter.QUERY,
+                description="Filter by topic (e.g. life, sports)",
+                enum=[c[0] for c in Topic.choices],
+            ),
+        ],
+    )
+    def list(self, request, *args, **kwargs):
+        return super().list(request, *args, **kwargs)
+
     def get_permissions(self):
         if self.action in ("create", "update", "partial_update"):
             return _perms(IsTeacherOrAdmin)
@@ -491,6 +526,18 @@ class ModuleViewSet(viewsets.ModelViewSet):
     @extend_schema(
         summary="List or create exercises within a module",
         request=s.ExerciseSerializer,
+        parameters=[
+            OpenApiParameter(
+                "band", OpenApiTypes.STR, OpenApiParameter.QUERY,
+                description="Filter by target band range (GET only)",
+                enum=[c[0] for c in BandLevel.choices],
+            ),
+            OpenApiParameter(
+                "topic", OpenApiTypes.STR, OpenApiParameter.QUERY,
+                description="Filter by topic (GET only)",
+                enum=[c[0] for c in Topic.choices],
+            ),
+        ],
         responses={200: s.ExerciseSerializer(many=True), 201: s.ExerciseSerializer},
     )
     @action(detail=True, methods=["get", "post"], url_path="exercises")
@@ -498,6 +545,12 @@ class ModuleViewSet(viewsets.ModelViewSet):
         module = self.get_object()
         if request.method == "GET":
             qs = Exercise.objects.filter(module=module).order_by("id")
+            band = request.query_params.get("band")
+            topic = request.query_params.get("topic")
+            if band:
+                qs = qs.filter(band=band)
+            if topic:
+                qs = qs.filter(topic=topic)
             return Response(s.ExerciseSerializer(qs, many=True).data)
         user = request.user
         if user.role not in (UserRole.TEACHER, UserRole.ADMIN):
@@ -514,16 +567,141 @@ class ModuleViewSet(viewsets.ModelViewSet):
 
 # ============================================================ Exercises
 @extend_schema(tags=["exercises"])
+def _filter_exercise_catalog(qs, params, drop=None):
+    """Apply the catalog's browse filters. `drop` skips one dimension so the
+    facet counts can answer "what would I get if I switched band/topic?"."""
+    band, topic = params.get("band"), params.get("topic")
+    ex_type, module_id, search = params.get("type"), params.get("module_id"), params.get("q")
+    if band and drop != "band":
+        qs = qs.filter(band=band)
+    if topic and drop != "topic":
+        qs = qs.filter(topic=topic)
+    if ex_type and drop != "type":
+        qs = qs.filter(exercise_type=ex_type)
+    if module_id:
+        qs = qs.filter(module_id=module_id)
+    if search:
+        qs = qs.filter(Q(title__icontains=search) | Q(prompt_text__icontains=search))
+    return qs
+
+
 class ExerciseViewSet(
-    mixins.RetrieveModelMixin, mixins.DestroyModelMixin, viewsets.GenericViewSet
+    mixins.ListModelMixin,
+    mixins.RetrieveModelMixin,
+    mixins.DestroyModelMixin,
+    viewsets.GenericViewSet,
 ):
     queryset = Exercise.objects.all().order_by("id")
     serializer_class = s.ExerciseSerializer
+
+    def get_serializer_class(self):
+        # The catalog list uses the light, answer-free row serializer.
+        if self.action == "list":
+            return s.ExerciseListSerializer
+        return s.ExerciseSerializer
+
+    def get_queryset(self):
+        qs = Exercise.objects.all().order_by("id")
+        if self.action != "list":
+            return qs
+        # Group the catalog by band then topic. Postgres sorts NULLs last on
+        # ASC, so exercises with no band/topic yet fall to the end rather than
+        # heading a list whose whole point is choosing by band or topic.
+        qs = (
+            qs.select_related("module")
+            .annotate(question_count=Count("questions"))
+            .order_by("band", "topic", "id")
+        )
+        return _filter_exercise_catalog(qs, self.request.query_params)
 
     def get_permissions(self):
         if self.action == "destroy":
             return _perms(IsTeacherOrAdmin)
         return _perms()
+
+    @extend_schema(
+        summary="Browse the exercise catalog by topic, band, type or keyword",
+        description=(
+            "Open to every authenticated user — this is how a student picks "
+            "practice by topic or band. Rows omit `questions` (and therefore "
+            "answer keys); fetch an exercise's detail to work on it."
+        ),
+        parameters=[
+            OpenApiParameter(
+                "band", OpenApiTypes.STR, OpenApiParameter.QUERY,
+                description="Target band range, e.g. band_5_6",
+                enum=[c[0] for c in BandLevel.choices],
+            ),
+            OpenApiParameter(
+                "topic", OpenApiTypes.STR, OpenApiParameter.QUERY,
+                description="Topic, e.g. life or sports",
+                enum=[c[0] for c in Topic.choices],
+            ),
+            OpenApiParameter(
+                "type", OpenApiTypes.STR, OpenApiParameter.QUERY,
+                description="Exercise type",
+                enum=[c[0] for c in ExerciseType.choices],
+            ),
+            OpenApiParameter(
+                "module_id", OpenApiTypes.INT, OpenApiParameter.QUERY,
+                description="Restrict to one learning module",
+            ),
+            OpenApiParameter(
+                "q", OpenApiTypes.STR, OpenApiParameter.QUERY,
+                description="Case-insensitive search over title and prompt",
+            ),
+        ],
+        responses={200: s.ExerciseListSerializer(many=True)},
+    )
+    def list(self, request, *args, **kwargs):
+        return super().list(request, *args, **kwargs)
+
+    @extend_schema(
+        summary="Counts per topic, band and type for the catalog filters",
+        description=(
+            "Lets the browse UI label each filter chip with how many exercises "
+            "it holds and hide empty ones. Each dimension's counts ignore its "
+            "own filter, so they show what switching to another band or topic "
+            "would give."
+        ),
+        parameters=[
+            OpenApiParameter("band", OpenApiTypes.STR, OpenApiParameter.QUERY),
+            OpenApiParameter("topic", OpenApiTypes.STR, OpenApiParameter.QUERY),
+            OpenApiParameter("type", OpenApiTypes.STR, OpenApiParameter.QUERY),
+            OpenApiParameter("module_id", OpenApiTypes.INT, OpenApiParameter.QUERY),
+            OpenApiParameter("q", OpenApiTypes.STR, OpenApiParameter.QUERY),
+        ],
+        responses={
+            200: inline_serializer(
+                name="ExerciseFacets",
+                fields={
+                    "total": drf_serializers.IntegerField(),
+                    "bands": drf_serializers.DictField(child=drf_serializers.IntegerField()),
+                    "topics": drf_serializers.DictField(child=drf_serializers.IntegerField()),
+                    "types": drf_serializers.DictField(child=drf_serializers.IntegerField()),
+                },
+            )
+        },
+    )
+    @action(detail=False, methods=["get"], url_path="facets")
+    def facets(self, request):
+        params = request.query_params
+
+        def counts(field, drop):
+            rows = (
+                _filter_exercise_catalog(Exercise.objects.all(), params, drop=drop)
+                .values(field)
+                .annotate(n=Count("id"))
+            )
+            # Untagged rows (null band/topic) aren't a choosable filter.
+            return {r[field]: r["n"] for r in rows if r[field]}
+
+        return Response({
+            "total": _filter_exercise_catalog(Exercise.objects.all(), params).count(),
+            "bands": counts("band", drop="band"),
+            "topics": counts("topic", drop="topic"),
+            "types": counts("exercise_type", drop="type"),
+        })
 
     @extend_schema(
         summary="List submissions for an exercise (teacher/admin)",
@@ -2106,3 +2284,99 @@ class PronunciationAttemptViewSet(viewsets.GenericViewSet):
                 qs, many=True, context={"request": request}
             ).data
         )
+
+
+# ============================================================ Meetings
+def _broadcast_meeting(meeting_id, payload):
+    """Best-effort push to a meeting's signaling group (room peers).
+    Same stance as _broadcast_class: never breaks the HTTP request."""
+    layer = get_channel_layer()
+    if layer is None or meeting_id is None:
+        return
+    try:
+        async_to_sync(layer.group_send)(
+            f"meeting_{meeting_id}", {"type": "signal", "payload": payload}
+        )
+    except Exception:
+        pass
+
+
+@extend_schema(tags=["meetings"])
+class MeetingViewSet(
+    mixins.CreateModelMixin,
+    mixins.RetrieveModelMixin,
+    mixins.ListModelMixin,
+    viewsets.GenericViewSet,
+):
+    """1:1 WebRTC meeting rooms. Create/end is teacher-side; students of the
+    class can list and retrieve (join happens over the signaling socket)."""
+
+    # Class-level queryset lets drf-spectacular derive the pk path type;
+    # real role scoping happens in get_queryset.
+    queryset = Meeting.objects.all()
+    serializer_class = s.MeetingSerializer
+
+    def get_queryset(self):
+        qs = Meeting.objects.select_related("klass", "created_by").order_by(
+            "-created_at", "-id"
+        )
+        user = self.request.user
+        if user.role == UserRole.TEACHER:
+            return qs.filter(klass__teacher=user)
+        if user.role == UserRole.STUDENT:
+            return qs.filter(klass__students__student=user).distinct()
+        return qs
+
+    def get_permissions(self):
+        if self.action in ("create", "end"):
+            return _perms(IsTeacherOrAdmin)
+        return _perms()
+
+    def perform_create(self, serializer):
+        user = self.request.user
+        klass = serializer.validated_data["klass"]
+        if user.role == UserRole.TEACHER and klass.teacher_id != user.id:
+            raise PermissionDenied("Not your class")
+        # A future booking opens as "scheduled" and flips to active only when
+        # the first peer joins (MeetingSignalConsumer stamps started_at); a
+        # start-now room is active and joinable immediately.
+        scheduled_at = serializer.validated_data.get("scheduled_at")
+        is_future = scheduled_at is not None and scheduled_at > timezone.now()
+        obj = serializer.save(
+            created_by=user,
+            status=MeetingStatus.SCHEDULED if is_future else MeetingStatus.ACTIVE,
+        )
+        _broadcast_class(
+            obj.klass_id,
+            {
+                "event": "meeting_scheduled" if is_future else "meeting_started",
+                "meeting_id": obj.id,
+                "title": obj.title,
+                "scheduled_at": scheduled_at.isoformat() if scheduled_at else None,
+            },
+        )
+
+    @extend_schema(
+        summary="End a meeting (teacher/admin)",
+        request=None,
+        responses={200: s.MeetingSerializer},
+    )
+    @action(detail=True, methods=["post"], url_path="end")
+    def end(self, request, pk=None):
+        obj = self.get_object()
+        user = request.user
+        if user.role == UserRole.TEACHER and obj.klass.teacher_id != user.id:
+            raise PermissionDenied("Not your meeting")
+        if obj.status != MeetingStatus.ENDED:
+            obj.status = MeetingStatus.ENDED
+            obj.ended_at = timezone.now()
+            obj.save(update_fields=["status", "ended_at"])
+            # Tell peers still in the room so they hang up client-side.
+            _broadcast_meeting(obj.id, {"type": "meeting_ended"})
+            # Tell the class so open /meetings lists drop the Join button.
+            _broadcast_class(
+                obj.klass_id, {"event": "meeting_ended", "meeting_id": obj.id}
+            )
+            # Free the 1:1 occupancy slot tracked by MeetingSignalConsumer.
+            cache.delete(f"meeting_occupancy_{obj.id}")
+        return Response(s.MeetingSerializer(obj).data)
