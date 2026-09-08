@@ -56,6 +56,8 @@ router.register(
     "pronunciation/attempts", views.PronunciationAttemptViewSet,
     basename="pronunciation-attempt",
 )
+# 1:1 WebRTC meeting rooms (signaling at ws/meetings/<id>/, core/routing.py).
+router.register("meetings", views.MeetingViewSet, basename="meeting")
 
 
 def root(_request):

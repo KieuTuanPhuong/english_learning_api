@@ -15,6 +15,7 @@ from django.contrib.auth.models import (
     PermissionsMixin,
 )
 from django.db import models
+from django.utils import timezone
 
 
 # ---------- Enums ----------
@@ -34,6 +35,30 @@ class DifficultyLevel(models.TextChoices):
     BEGINNER = "beginner", "Beginner"
     INTERMEDIATE = "intermediate", "Intermediate"
     ADVANCED = "advanced", "Advanced"
+
+
+class BandLevel(models.TextChoices):
+    """IELTS-style target band range for a module/exercise."""
+
+    BAND_4_5 = "band_4_5", "Band 4–5"
+    BAND_5_6 = "band_5_6", "Band 5–6"
+    BAND_6_7 = "band_6_7", "Band 6–7"
+    BAND_7_8 = "band_7_8", "Band 7–8"
+    BAND_8_9 = "band_8_9", "Band 8–9"
+
+
+class Topic(models.TextChoices):
+    """Thematic topic for a module/exercise (catalog filtering)."""
+
+    LIFE = "life", "Life"
+    SPORTS = "sports", "Sports"
+    EDUCATION = "education", "Education"
+    WORK = "work", "Work"
+    TRAVEL = "travel", "Travel"
+    ENVIRONMENT = "environment", "Environment"
+    TECHNOLOGY = "technology", "Technology"
+    HEALTH = "health", "Health"
+    CULTURE = "culture", "Culture"
 
 
 class ExerciseType(models.TextChoices):
@@ -173,6 +198,13 @@ class LearningModule(models.Model):
     difficulty_level = models.CharField(
         max_length=20, choices=DifficultyLevel.choices, null=True, blank=True
     )
+    # Catalog grading/theming — nullable so legacy rows stay valid.
+    band = models.CharField(
+        max_length=20, choices=BandLevel.choices, null=True, blank=True
+    )
+    topic = models.CharField(
+        max_length=20, choices=Topic.choices, null=True, blank=True
+    )
     created_by = models.ForeignKey(
         User, null=True, blank=True, on_delete=models.SET_NULL,
         related_name="modules_created",
@@ -213,6 +245,14 @@ class Exercise(models.Model):
     )
     title = models.CharField(max_length=255)
     exercise_type = models.CharField(max_length=20, choices=ExerciseType.choices)
+    # Catalog grading/theming — independent of the module's values so an
+    # exercise can target a narrower band/topic than its module.
+    band = models.CharField(
+        max_length=20, choices=BandLevel.choices, null=True, blank=True
+    )
+    topic = models.CharField(
+        max_length=20, choices=Topic.choices, null=True, blank=True
+    )
     # docs.md exercises.instructions — kept as prompt_text.
     prompt_text = models.TextField()
     # docs.md exercises.content_text — reading passage body (receptive Reading).
@@ -1264,3 +1304,53 @@ class PronunciationAttempt(models.Model):
 
     def __str__(self):
         return f"Attempt {self.pk} by {self.student_id} on drill {self.drill_id}"
+
+
+# ---------- Meeting ----------
+class MeetingStatus(models.TextChoices):
+    SCHEDULED = "scheduled"  # booked for a future scheduled_at, nobody joined yet
+    ACTIVE = "active"
+    ENDED = "ended"
+
+
+class Meeting(models.Model):
+    """A live 1:1 teacher-student video room (MVP demo). The row only carries
+    room metadata; media flows peer-to-peer via WebRTC, with SDP/ICE signaling
+    relayed over ws/meetings/<id>/ (core.consumers.MeetingSignalConsumer).
+
+    Three timestamps drive the UI clock: `scheduled_at` (the teacher's booking,
+    null for start-now rooms), `started_at` (stamped when the first peer
+    actually joins) and `ended_at`. The live timer counts from started_at; the
+    post-meeting duration is ended_at - started_at."""
+
+    klass = models.ForeignKey(
+        Class, on_delete=models.CASCADE, related_name="meetings"
+    )
+    created_by = models.ForeignKey(
+        User, null=True, blank=True, on_delete=models.SET_NULL,
+        related_name="meetings_created",
+    )
+    title = models.CharField(max_length=255)
+    status = models.CharField(
+        max_length=20, choices=MeetingStatus.choices, default=MeetingStatus.ACTIVE
+    )
+    scheduled_at = models.DateTimeField(null=True, blank=True)
+    started_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    ended_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = "meetings"
+        ordering = ["-created_at", "-id"]
+
+    def __str__(self):
+        return f"{self.title} ({self.get_status_display()})"
+
+    @property
+    def duration_seconds(self):
+        """Final call length once ended, live elapsed while running, None
+        before the first peer joins."""
+        if self.started_at is None:
+            return None
+        end = self.ended_at or timezone.now()
+        return int((end - self.started_at).total_seconds())
