@@ -309,6 +309,7 @@ class SectionAttemptInline(admin.TabularInline):
     readonly_fields = (
         "section", "status", "started_at", "expires_at", "completed_at",
         "raw_score", "raw_max", "converted_score", "draft_answers",
+        "ai_status", "ai_started_at", "ai_finished_at", "ai_error",
     )
     can_delete = False
 

@@ -83,6 +83,9 @@ MISTAKES_SCHEMA = {
             "items": {
                 "type": "OBJECT",
                 "properties": {
+                    # Set for receptive tasks so a report can pin the
+                    # explanation to its question; null for writing/speaking.
+                    "question_id": {"type": "INTEGER", "nullable": True},
                     "location": {"type": "STRING"},
                     "student_answer": {"type": "STRING"},
                     "correction": {"type": "STRING"},
@@ -109,7 +112,7 @@ def _clip(text, limit=_MAX_TEXT):
     return text if len(text) <= limit else text[:limit] + " …[truncated]"
 
 
-def _receptive_breakdown(submission) -> list[dict]:
+def receptive_breakdown(submission) -> list[dict]:
     """Per-question view of a reading/listening/quiz submission: what was
     asked, what the key is, what the student chose, and whether it matched.
     Reuses the exact matching rules of ``Submission.grade_detail``."""
@@ -142,6 +145,9 @@ def _receptive_breakdown(submission) -> list[dict]:
             row["is_correct"] = None  # open-ended; no key
         rows.append(row)
     return rows
+
+
+_receptive_breakdown = receptive_breakdown  # backwards-compatible name
 
 
 def _speaking_transcript(submission) -> str | None:
@@ -179,7 +185,7 @@ def build_context(submission) -> dict:
         # rows carry it in comments only, so look at the payload we control).
         ctx["transcript"] = _speaking_transcript(submission)
     else:
-        ctx["questions"] = _receptive_breakdown(submission)
+        ctx["questions"] = receptive_breakdown(submission)
 
     template = RubricTemplate.resolve_for(exercise)
     if template is not None:
@@ -271,6 +277,7 @@ class MockAssistBackend(BaseAssistBackend):
             if q.get("is_correct") is False:
                 key = q.get("correct_options") or q.get("correct_answers") or []
                 mistakes.append({
+                    "question_id": q["question_id"],
                     "location": f"Question {q.get('order', q['question_id'])}",
                     "student_answer": json.dumps(q.get("student_answer")),
                     "correction": ", ".join(map(str, key)),
@@ -281,6 +288,7 @@ class MockAssistBackend(BaseAssistBackend):
         text = ctx.get("writing_text") or ""
         if text and " go to " in f" {text} ":
             mistakes.append({
+                "question_id": None,
                 "location": "go to",
                 "student_answer": "go",
                 "correction": "went / goes (check tense)",
@@ -333,6 +341,9 @@ _MISTAKES_SYSTEM = textwrap.dedent("""
     list and say so in the summary. Use existing teacher annotations/feedback
     as hints but verify them yourself. Keep each explanation under 60 words.
     "practice_suggestions": 2-4 short, concrete follow-up activities.
+    For receptive tasks set "question_id" to the question_id of the question
+    each mistake belongs to (one entry per wrong question, never for a correct
+    one); leave it null for writing and speaking mistakes.
 """).strip()
 
 

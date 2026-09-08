@@ -947,6 +947,16 @@ class SectionStatus(models.TextChoices):
     COMPLETED = "completed", "Completed"
 
 
+class AiGradingStatus(models.TextChoices):
+    """Where a completed section stands with automatic AI marking
+    (core/mock_tests.py:ai_grade_section). ``pending`` also covers sections
+    that are not finished yet — the grader only ever claims completed ones."""
+    PENDING = "pending", "Pending"
+    RUNNING = "running", "Running"
+    DONE = "done", "Done"
+    FAILED = "failed", "Failed"
+
+
 class TestAttempt(models.Model):
     template = models.ForeignKey(
         MockTestTemplate, on_delete=models.PROTECT, related_name="attempts"
@@ -1004,6 +1014,18 @@ class SectionAttempt(models.Model):
     converted_score = models.DecimalField(
         max_digits=6, decimal_places=2, null=True, blank=True
     )
+    # Automatic AI marking, run after submit (core/mock_tests.py). Writing and
+    # Speaking tasks get an AI Feedback row each (which is what converts the
+    # section to a band); Listening and Reading tasks get a stored AiInsight
+    # explaining every wrong answer. ``ai_error`` keeps the last failure so the
+    # report can offer a retry instead of failing silently.
+    ai_status = models.CharField(
+        max_length=20, choices=AiGradingStatus.choices,
+        default=AiGradingStatus.PENDING,
+    )
+    ai_started_at = models.DateTimeField(null=True, blank=True)
+    ai_finished_at = models.DateTimeField(null=True, blank=True)
+    ai_error = models.TextField(blank=True, default="")
 
     class Meta:
         db_table = "section_attempts"
