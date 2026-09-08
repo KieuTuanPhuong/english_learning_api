@@ -1941,7 +1941,42 @@ class TestAttemptViewSet(
     def report(self, request, pk=None):
         attempt = self.get_object()
         return Response(
-            s.TestAttemptReportSerializer(mock_tests.build_report(attempt)).data
+            s.TestAttemptReportSerializer(
+                mock_tests.build_report(attempt, request=request)
+            ).data
+        )
+
+    @extend_schema(
+        summary="Run automatic AI marking for the attempt's completed sections",
+        description=(
+            "Claims every completed section whose AI marking is pending, "
+            "failed or stuck and grades it in the background: Writing/Speaking "
+            "tasks get an AI Feedback row (which sets the section band); "
+            "Listening/Reading tasks get a per-question explanation of each "
+            "wrong answer, folded into the report's `submissions[].questions`. "
+            "Sections are claimed automatically on submit, so this is the "
+            "retry / catch-up path. Returns the report: 202 when something was "
+            "claimed, 200 when there was nothing to do. Poll the report while "
+            "any section's `ai_status` is `running`."
+        ),
+        request=None,
+        responses={
+            200: s.TestAttemptReportSerializer,
+            202: s.TestAttemptReportSerializer,
+        },
+    )
+    @action(detail=True, methods=["post"], url_path="ai-grade")
+    def ai_grade(self, request, pk=None):
+        attempt = self.get_object()
+        claimed = mock_tests.claim_ai_grading(attempt)
+        mock_tests.schedule_ai_grading(claimed)
+        attempt.refresh_from_db()  # inline grading may have set overall_score
+        report = s.TestAttemptReportSerializer(
+            mock_tests.build_report(attempt, request=request)
+        ).data
+        return Response(
+            report,
+            status=status.HTTP_202_ACCEPTED if claimed else status.HTTP_200_OK,
         )
 
 

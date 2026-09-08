@@ -767,6 +767,9 @@ class MockTestTests(APITransactionTestCase):
             mock_tests.convert_score(self.format, SectionSkill.LISTENING, 3)
         )
 
+    # Automatic AI marking normally grades Writing at submit; switch it off to
+    # exercise the teacher-grading path that the report also has to survive.
+    @override_settings(MOCK_TEST_AI_AUTOGRADE=False)
     def test_overall_waits_for_productive_grading(self):
         attempt = self._attempt()
         reading = self._section(attempt, 0)
@@ -2825,3 +2828,341 @@ class ProductionReadinessTests(APITransactionTestCase):
         with mock.patch.dict(os.environ, {"H": " a.com , ,b.com "}, clear=False):
             self.assertEqual(env_list("H"), ["a.com", "b.com"])
         self.assertEqual(env_list("DEFINITELY_UNSET_VAR_NAME"), [])
+
+
+# ==================== Mock tests: automatic AI marking ====================
+from datetime import timedelta  # noqa: E402
+from django.test import override_settings as _override_settings  # noqa: E402
+from core.models import (  # noqa: E402
+    AiGradingStatus as _AiGradingStatus,
+    AiInsightKind,
+)
+
+
+@_override_settings(
+    AI_BACKEND="mock", AI_ASSIST_BACKEND="mock",
+    MOCK_TEST_AI_AUTOGRADE=True, MOCK_TEST_AI_ASYNC=False,
+)
+class MockTestAiGradingTests(APITransactionTestCase):
+    """Every submitted section is marked by the AI layer (core/mock_tests.py):
+    Writing/Speaking through the grading backend, Listening/Reading through a
+    stored per-question mistake explanation. Deterministic mock backends —
+    no network."""
+
+    def setUp(self):
+        self.teacher = User.objects.create_user(
+            email="ai-teacher@test.app", password="password123",
+            full_name="AI Teacher", role=UserRole.TEACHER,
+        )
+        self.student = User.objects.create_user(
+            email="ai-student@test.app", password="password123",
+            full_name="AI Student", role=UserRole.STUDENT,
+        )
+        self.other_student = User.objects.create_user(
+            email="ai-other@test.app", password="password123",
+            full_name="Other", role=UserRole.STUDENT,
+        )
+        self.admin = User.objects.create_user(
+            email="ai-admin@test.app", password="password123",
+            full_name="AI Admin", role=UserRole.ADMIN,
+        )
+        self.format = TestFormat.objects.create(
+            slug="ielts_academic", name="IELTS Academic", version="2026",
+            overall_strategy=OverallStrategy.BAND_AVERAGE, score_precision="0.5",
+        )
+        ScoreConversionTable.objects.create(
+            format=self.format, skill=SectionSkill.READING,
+            mapping={"0": "0.0", "1": "4.0", "2": "5.0"}, source_note="t",
+        )
+        ScoreConversionTable.objects.create(
+            format=self.format, skill=SectionSkill.WRITING,
+            mapping={"0": "0.0", "50": "6.0", "80": "8.0"}, source_note="t",
+        )
+        module = LearningModule.objects.create(title="AI module", created_by=self.teacher)
+        self.reading_ex = Exercise.objects.create(
+            module=module, title="Passage 1", exercise_type=ExerciseType.READING,
+            prompt_text="Read.", content_text="Paris is the capital of France.",
+            created_by=self.teacher,
+        )
+        self.q1 = Question.objects.create(exercise=self.reading_ex, text="Pick one", order=0)
+        self.q1_wrong = QuestionOption.objects.create(question=self.q1, text="A", order=0)
+        self.q1_right = QuestionOption.objects.create(
+            question=self.q1, text="B", is_correct=True, order=1,
+        )
+        self.q2 = Question.objects.create(
+            exercise=self.reading_ex, text="The capital is [[Paris]].", order=1,
+        )
+        self.writing_ex = Exercise.objects.create(
+            module=module, title="Task 1", exercise_type=ExerciseType.WRITING,
+            prompt_text="Write 150 words.", created_by=self.teacher,
+        )
+        self.template = MockTestTemplate.objects.create(
+            format=self.format, title="AI-marked test", created_by=self.admin,
+        )
+        self.reading_section = TestSection.objects.create(
+            template=self.template, skill=SectionSkill.READING, title="Reading",
+            order=0, duration_minutes=60,
+        )
+        TestSectionExercise.objects.create(
+            section=self.reading_section, exercise=self.reading_ex, order=0,
+        )
+        self.writing_section = TestSection.objects.create(
+            template=self.template, skill=SectionSkill.WRITING, title="Writing",
+            order=1, duration_minutes=60,
+        )
+        TestSectionExercise.objects.create(
+            section=self.writing_section, exercise=self.writing_ex, order=0,
+        )
+
+    # ---- helpers ----
+    def _login(self, user):
+        resp = self.client.post(
+            reverse("login"), {"email": user.email, "password": "password123"}
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {resp.data['access_token']}")
+
+    def _reading_draft(self, first_option):
+        return {
+            "answers": {
+                str(self.reading_ex.id): {
+                    "version": 1,
+                    "responses": [
+                        {"question_id": self.q1.id, "type": "mcq",
+                         "option_id": first_option.id},
+                        {"question_id": self.q2.id, "type": "fill_blank",
+                         "text": '["paris"]'},
+                    ],
+                },
+            },
+            "writing": {},
+            "meta": {"audio_played": []},
+        }
+
+    def _writing_draft(self, text):
+        return {"answers": {}, "writing": {str(self.writing_ex.id): text}, "meta": {}}
+
+    def _sit(self, reading_option=None, writing_text=None):
+        """Start an attempt and submit its sections in order. ``None`` leaves a
+        section untouched."""
+        attempt = mock_tests.start_attempt(self.template, self.student)
+        reading = attempt.sections.get(section__order=0)
+        writing = attempt.sections.get(section__order=1)
+        if reading_option is not None:
+            mock_tests.start_section(attempt, reading.id)
+            mock_tests.submit_section(
+                attempt, reading.id, draft=self._reading_draft(reading_option),
+            )
+        if writing_text is not None:
+            mock_tests.start_section(attempt, writing.id)
+            mock_tests.submit_section(
+                attempt, writing.id, draft=self._writing_draft(writing_text),
+            )
+        return attempt
+
+    def _report(self, attempt):
+        resp = self.client.get(reverse("mock-test-attempt-report", args=[attempt.id]))
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.data)
+        return resp.data
+
+    # ---- receptive sections ----
+    def test_reading_section_gets_per_question_explanations(self):
+        attempt = self._sit(reading_option=self.q1_wrong)
+        reading = attempt.sections.get(section__order=0)
+        self.assertEqual(reading.ai_status, _AiGradingStatus.DONE, reading.ai_error)
+        submission = reading.submissions.get().submission
+        insight = submission.ai_insights.get(kind=AiInsightKind.MISTAKE_EXPLANATION)
+        self.assertEqual(insight.engine, "mock")
+        self.assertIsNone(insight.requested_by)
+
+        self._login(self.student)
+        section = self._report(attempt)["sections"][0]
+        self.assertEqual(section["ai_status"], "done")
+        self.assertEqual(section["raw_score"], 1)
+        task = section["submissions"][0]
+        self.assertEqual(task["ai_status"], "done")
+        self.assertEqual(task["exercise_title"], "Passage 1")
+        self.assertIn("mistake", task["explanation"]["summary"])
+        wrong, right = task["questions"]
+        self.assertEqual((wrong["number"], right["number"]), (1, 2))
+        self.assertFalse(wrong["is_correct"])
+        self.assertEqual(wrong["student_answer"], "A")
+        self.assertEqual(wrong["correct"], ["B"])
+        self.assertTrue(wrong["explanation"])
+        self.assertTrue(wrong["tip"])
+        self.assertTrue(right["is_correct"])
+        self.assertEqual(right["student_answer"], "paris")
+        self.assertEqual(right["correct"], ["Paris"])
+        self.assertIsNone(right["explanation"])
+        # The key stays masked in the question text, as in the student card.
+        self.assertNotIn("[[Paris]]", right["question"])
+
+    def test_perfect_reading_section_needs_no_model_call(self):
+        attempt = self._sit(reading_option=self.q1_right)
+        submission = attempt.sections.get(section__order=0).submissions.get().submission
+        insight = submission.ai_insights.get(kind=AiInsightKind.MISTAKE_EXPLANATION)
+        self.assertEqual(insight.engine, "auto")
+        self.assertEqual(insight.payload["mistakes"], [])
+        self.assertIn("All 2 answers are correct", insight.payload["summary"])
+
+    # ---- productive sections ----
+    def test_writing_is_graded_by_ai_and_the_report_completes(self):
+        attempt = self._sit(
+            reading_option=self.q1_right,
+            writing_text="Yesterday I go to the park. However, it was closed.",
+        )
+        attempt.refresh_from_db()
+        writing = attempt.sections.get(section__order=1)
+        self.assertEqual(writing.ai_status, _AiGradingStatus.DONE, writing.ai_error)
+        submission = writing.submissions.get().submission
+        feedback = submission.feedback.get()
+        self.assertTrue(feedback.is_ai_generated)
+        self.assertIsNone(feedback.reviewer)
+        self.assertEqual(submission.status, SubmissionStatus.AI_GRADED)
+        self.assertIsNotNone(writing.converted_score)
+        self.assertEqual(attempt.status, AttemptStatus.COMPLETED)
+        self.assertIsNotNone(attempt.overall_score)
+
+        self._login(self.student)
+        report = self._report(attempt)
+        self.assertFalse(report["partial"])
+        task = report["sections"][1]["submissions"][0]
+        self.assertEqual(task["ai_status"], "done")
+        self.assertTrue(task["feedback"]["is_ai_generated"])
+        self.assertEqual(task["feedback"]["score"], str(feedback.score))
+        self.assertEqual(task["writing_text"], submission.writing_text)
+        self.assertIsNone(task["audio_url"])
+        self.assertEqual(task["questions"], [])
+
+    def test_speaking_recording_is_served_through_a_signed_link(self):
+        speaking_ex = Exercise.objects.create(
+            module=self.writing_ex.module, title="Part 1",
+            exercise_type=ExerciseType.SPEAKING, prompt_text="Talk.",
+            created_by=self.teacher,
+        )
+        section = TestSection.objects.create(
+            template=self.template, skill=SectionSkill.SPEAKING, title="Speaking",
+            order=2, duration_minutes=14,
+        )
+        TestSectionExercise.objects.create(section=section, exercise=speaking_ex, order=0)
+        attempt = mock_tests.start_attempt(self.template, self.student, mode="practice")
+        speaking = attempt.sections.get(section__order=2)
+        mock_tests.start_section(attempt, speaking.id)
+        mock_tests.submit_section(
+            attempt, speaking.id, draft={},
+            recordings={str(speaking_ex.id): "/media/mock-tests/2026/09/answer.webm"},
+        )
+        self._login(self.student)
+        task = self._report(attempt)["sections"][2]["submissions"][0]
+        self.assertEqual(task["audio_recording_url"], "/media/mock-tests/2026/09/answer.webm")
+        self.assertTrue(task["audio_url"].startswith("http://testserver/media/mock-tests/2026/09/answer.webm?t="))
+        self.assertTrue(task["feedback"]["is_ai_generated"])  # mock engine graded it
+
+    def test_empty_writing_scores_zero_without_a_model_call(self):
+        attempt = self._sit(reading_option=self.q1_right, writing_text="   ")
+        submission = attempt.sections.get(section__order=1).submissions.get().submission
+        feedback = submission.feedback.get()
+        self.assertEqual(feedback.score, Decimal("0"))
+        self.assertIn("No response", feedback.comments)
+        self.assertEqual(
+            attempt.sections.get(section__order=1).converted_score, Decimal("0.0"),
+        )
+
+    def test_a_teachers_mark_is_never_overridden(self):
+        with _override_settings(MOCK_TEST_AI_AUTOGRADE=False):
+            attempt = self._sit(reading_option=self.q1_right, writing_text="Some text.")
+        writing = attempt.sections.get(section__order=1)
+        self.assertEqual(writing.ai_status, _AiGradingStatus.PENDING)
+        submission = writing.submissions.get().submission
+        Feedback.objects.create(
+            submission=submission, reviewer=self.teacher, score=Decimal("70"),
+            comments="Teacher mark",
+        )
+        self._login(self.student)
+        resp = self.client.post(reverse("mock-test-attempt-ai-grade", args=[attempt.id]))
+        self.assertEqual(resp.status_code, status.HTTP_202_ACCEPTED)
+        self.assertEqual(submission.feedback.count(), 1)
+        self.assertFalse(submission.feedback.filter(is_ai_generated=True).exists())
+        self.assertEqual(resp.data["sections"][1]["ai_status"], "done")
+
+    # ---- the explicit endpoint ----
+    def test_ai_grade_is_idempotent_and_retries_failed_sections(self):
+        attempt = self._sit(reading_option=self.q1_wrong, writing_text="Some text.")
+        self._login(self.student)
+        url = reverse("mock-test-attempt-ai-grade", args=[attempt.id])
+        insights = AiInsight.objects.count()
+        feedback = Feedback.objects.count()
+
+        resp = self.client.post(url)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)  # nothing to claim
+        self.assertEqual((AiInsight.objects.count(), Feedback.objects.count()),
+                         (insights, feedback))
+
+        reading = attempt.sections.get(section__order=0)
+        reading.submissions.get().submission.ai_insights.all().delete()
+        reading.ai_status = _AiGradingStatus.FAILED
+        reading.ai_error = "boom"
+        reading.save(update_fields=["ai_status", "ai_error"])
+
+        resp = self.client.post(url)
+        self.assertEqual(resp.status_code, status.HTTP_202_ACCEPTED)
+        section = resp.data["sections"][0]
+        self.assertEqual(section["ai_status"], "done")
+        self.assertEqual(section["ai_error"], "")
+        self.assertEqual(AiInsight.objects.count(), insights)  # regenerated once
+        self.assertEqual(Feedback.objects.count(), feedback)   # writing untouched
+
+    def test_stale_running_section_is_reported_failed_and_reclaimable(self):
+        attempt = self._sit(reading_option=self.q1_wrong)
+        reading = attempt.sections.get(section__order=0)
+        reading.submissions.get().submission.ai_insights.all().delete()
+        reading.ai_status = _AiGradingStatus.RUNNING
+        reading.ai_started_at = timezone.now() - timedelta(hours=1)
+        reading.save(update_fields=["ai_status", "ai_started_at"])
+
+        self._login(self.student)
+        section = self._report(attempt)["sections"][0]
+        self.assertEqual(section["ai_status"], "failed")
+        self.assertIn("interrupted", section["ai_error"])
+
+        resp = self.client.post(reverse("mock-test-attempt-ai-grade", args=[attempt.id]))
+        self.assertEqual(resp.status_code, status.HTTP_202_ACCEPTED)
+        self.assertEqual(resp.data["sections"][0]["ai_status"], "done")
+
+    def test_ai_grade_follows_report_visibility(self):
+        attempt = self._sit(reading_option=self.q1_wrong)
+        url = reverse("mock-test-attempt-ai-grade", args=[attempt.id])
+        self._login(self.other_student)
+        self.assertEqual(self.client.post(url).status_code, status.HTTP_403_FORBIDDEN)
+        self._login(self.teacher)  # not this student's teacher
+        self.assertEqual(self.client.post(url).status_code, status.HTTP_403_FORBIDDEN)
+        ClassStudent.objects.create(
+            klass=Class.objects.create(
+                class_name="AI class", teacher=self.teacher, academic_year="2026",
+            ),
+            student=self.student,
+        )
+        self.assertEqual(self.client.post(url).status_code, status.HTTP_200_OK)
+        self._login(self.admin)
+        self.assertEqual(self.client.post(url).status_code, status.HTTP_200_OK)
+
+    def test_unfinished_sections_are_neither_claimed_nor_detailed(self):
+        attempt = self._sit(reading_option=self.q1_wrong)  # writing not started
+        self._login(self.student)
+        report = self._report(attempt)
+        writing = report["sections"][1]
+        self.assertEqual(writing["status"], "not_started")
+        self.assertEqual(writing["ai_status"], "pending")
+        self.assertEqual(writing["submissions"], [])
+        resp = self.client.post(reverse("mock-test-attempt-ai-grade", args=[attempt.id]))
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            attempt.sections.get(section__order=1).ai_status, _AiGradingStatus.PENDING,
+        )
+
+    def test_autograde_switch_leaves_sections_pending(self):
+        with _override_settings(MOCK_TEST_AI_AUTOGRADE=False):
+            attempt = self._sit(reading_option=self.q1_wrong)
+        reading = attempt.sections.get(section__order=0)
+        self.assertEqual(reading.ai_status, _AiGradingStatus.PENDING)
+        self.assertFalse(AiInsight.objects.exists())

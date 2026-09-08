@@ -196,6 +196,7 @@ SPECTACULAR_SETTINGS = {
         "SectionStatusEnum": "core.models.SectionStatus.choices",
         "MeetingStatusEnum": "core.models.MeetingStatus.choices",
         "AiInsightKindEnum": "core.models.AiInsightKind.choices",
+        "AiGradingStatusEnum": "core.models.AiGradingStatus.choices",
     },
     # Bearer JWT — show the Authorize button in Swagger UI.
     "SECURITY": [{"jwtAuth": []}],
@@ -355,6 +356,13 @@ AI_FALLBACK_PROVIDER = os.getenv("AI_FALLBACK_PROVIDER", "gemini" if GEMINI_API_
 AI_ASSIST_BACKEND = (
     os.getenv("AI_ASSIST_BACKEND") or ("llm" if (GEMINI_API_KEY or NVIDIA_API_KEY) else "mock")
 ).lower()
+
+# Mock-test AI auto-grading (core/mock_tests.py). Every submitted section is
+# claimed for AI marking on the spot; the marking itself runs on a background
+# thread so a queued NIM model never blocks the student's Submit. The test
+# runner grades inline so assertions see the result at once.
+MOCK_TEST_AI_AUTOGRADE = env_bool("MOCK_TEST_AI_AUTOGRADE", True)
+MOCK_TEST_AI_ASYNC = env_bool("MOCK_TEST_AI_ASYNC", True) and not TESTING
 
 # Pronunciation-assessment engine switch (sibling of AI_BACKEND). "mock"
 # (default, deterministic/offline), "gemini" (live audio assessment via

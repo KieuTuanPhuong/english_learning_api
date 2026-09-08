@@ -15,6 +15,7 @@ from rest_framework import serializers
 
 from . import media, mock_tests
 from .models import (
+    AiGradingStatus,
     AiInsight,
     Assignment,
     Class,
@@ -495,6 +496,9 @@ class FeedbackReviewSerializer(serializers.Serializer):
 
 
 class AiMistakeSerializer(serializers.Serializer):
+    # Present for receptive (reading/listening/quiz) mistakes so a report can
+    # attach the explanation to its question; null for writing/speaking.
+    question_id = serializers.IntegerField(allow_null=True, required=False)
     location = serializers.CharField()
     student_answer = serializers.CharField(allow_blank=True)
     correction = serializers.CharField(allow_blank=True)
@@ -992,6 +996,66 @@ class SectionSubmitSerializer(serializers.Serializer):
     )
 
 
+class QuestionReviewSerializer(serializers.Serializer):
+    """One answered question of a Listening/Reading task in the score report:
+    the key, what the student gave, and — once the AI has looked at it — why a
+    wrong answer is wrong. Only ever built for a *completed* section, so
+    exposing the key here is safe."""
+
+    question_id = serializers.IntegerField()
+    # 1-based, continuous across the section's tasks (IELTS numbering).
+    number = serializers.IntegerField()
+    question = serializers.CharField()
+    options = serializers.ListField(child=serializers.CharField())
+    correct = serializers.ListField(child=serializers.CharField())
+    student_answer = serializers.CharField(allow_null=True, allow_blank=True)
+    # null = no answer key (open question), so neither right nor wrong.
+    is_correct = serializers.BooleanField(allow_null=True)
+    explanation = serializers.CharField(allow_null=True, allow_blank=True)
+    tip = serializers.CharField(allow_null=True, allow_blank=True)
+    category = serializers.CharField(allow_null=True, allow_blank=True)
+
+
+class ReportExplanationSerializer(serializers.Serializer):
+    """Task-level part of a stored mistake explanation (the per-question
+    mistakes are folded into ``QuestionReviewSerializer`` rows)."""
+
+    summary = serializers.CharField(allow_blank=True)
+    strengths = serializers.ListField(child=serializers.CharField())
+    practice_suggestions = serializers.ListField(child=serializers.CharField())
+    engine = serializers.CharField(allow_blank=True)
+    created_at = serializers.DateTimeField()
+
+
+class ReportFeedbackSerializer(serializers.Serializer):
+    """Newest feedback on a Writing/Speaking task (AI or teacher)."""
+
+    id = serializers.IntegerField()
+    score = serializers.DecimalField(max_digits=5, decimal_places=2, allow_null=True)
+    comments = serializers.CharField(allow_null=True, allow_blank=True)
+    is_ai_generated = serializers.BooleanField()
+    created_at = serializers.DateTimeField()
+
+
+class SubmissionReviewSerializer(serializers.Serializer):
+    """One task of a completed section, with whatever the AI produced for it."""
+
+    submission_id = serializers.IntegerField()
+    exercise_id = serializers.IntegerField()
+    exercise_title = serializers.CharField()
+    exercise_type = serializers.CharField()
+    # `done` once the AI artefact for this task exists (an explanation for a
+    # receptive task, a feedback row for a productive one).
+    ai_status = serializers.ChoiceField(choices=[("pending", "Pending"), ("done", "Done")])
+    questions = QuestionReviewSerializer(many=True)
+    explanation = ReportExplanationSerializer(allow_null=True)
+    feedback = ReportFeedbackSerializer(allow_null=True)
+    writing_text = serializers.CharField(allow_null=True, allow_blank=True)
+    audio_recording_url = serializers.CharField(allow_null=True, allow_blank=True)
+    # Signed, playable form of the recording (see SubmissionSerializer.audio_url).
+    audio_url = serializers.CharField(allow_null=True, allow_blank=True)
+
+
 class SectionScoreSerializer(serializers.Serializer):
     """One row of the score report (read-only projection, not a model)."""
 
@@ -1007,6 +1071,13 @@ class SectionScoreSerializer(serializers.Serializer):
     )
     pending_grading = serializers.BooleanField()
     submission_ids = serializers.ListField(child=serializers.IntegerField())
+    # Automatic AI marking (core/mock_tests.py). `pending` = nothing claimed
+    # yet (POST /ai-grade/ or the post-submit hook will), `running` = in the
+    # background, `failed` = retry via POST /ai-grade/ (see `ai_error`).
+    ai_status = serializers.ChoiceField(choices=AiGradingStatus.choices)
+    ai_error = serializers.CharField(allow_blank=True)
+    # Empty until the section is completed.
+    submissions = SubmissionReviewSerializer(many=True)
 
 
 class TestAttemptReportSerializer(serializers.Serializer):

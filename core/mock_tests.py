@@ -8,16 +8,27 @@ Views are thin wrappers that translate the exceptions below into HTTP codes.
 
 from __future__ import annotations
 
+import json
+import logging
+import re
+import threading
 from datetime import timedelta
 from decimal import Decimal, ROUND_HALF_UP
 
-from django.db import transaction
+from django.conf import settings
+from django.db import connection, transaction
+from django.db.models import Q
 from django.utils import timezone
 
+from . import media
 from .models import (
+    AiGradingStatus,
+    AiInsight,
+    AiInsightKind,
     AttemptMode,
     AttemptStatus,
     Exercise,
+    Feedback,
     ItemFlow,
     MockTestTemplate,
     OverallStrategy,
@@ -30,11 +41,15 @@ from .models import (
     SectionStatus,
     SectionSubmission,
     Submission,
+    SubmissionStatus,
+    SubmissionType,
     TestAttempt,
     TestFormat,
     TestSection,
     TestSectionExercise,
 )
+
+log = logging.getLogger(__name__)
 
 # Network latency / last-keystroke allowance on top of the advertised duration.
 # The client counts down to `expires_at`, which already includes it.
@@ -427,6 +442,7 @@ def submit_section(
 
     _finalize_section(target, recordings=recordings or {})
     _maybe_complete_attempt(attempt)
+    queue_ai_grading(attempt, [target.pk])
     return target
 
 
@@ -492,6 +508,8 @@ def expire_stale_sections(now=None) -> int:
         with transaction.atomic():
             _finalize_section(section_attempt, recordings={})
             _maybe_complete_attempt(section_attempt.attempt)
+            # A cron sweep has no long-lived process to hand a thread to.
+            queue_ai_grading(section_attempt.attempt, [section_attempt.pk], sync=True)
         count += 1
     return count
 
@@ -704,15 +722,19 @@ def _get_section_attempt(attempt: TestAttempt, section_attempt_id: int) -> Secti
     return section_attempt
 
 
-def build_report(attempt: TestAttempt) -> dict:
+def build_report(attempt: TestAttempt, request=None) -> dict:
     """Score-report payload. ``partial`` is true while any section is missing a
-    converted score (typically Writing/Speaking awaiting grading)."""
+    converted score (typically Writing/Speaking awaiting grading). ``request``
+    makes the signed audio links absolute (core/media.py)."""
     sections = list(
         attempt.sections.select_related("section").order_by("section__order", "id")
     )
+    now = timezone.now()
     rows = []
     for section_attempt in sections:
         section = section_attempt.section
+        completed = section_attempt.status == SectionStatus.COMPLETED
+        ai_status, ai_error = ai_state(section_attempt, now)
         rows.append({
             "section_attempt_id": section_attempt.id,
             "section_id": section.id,
@@ -723,12 +745,17 @@ def build_report(attempt: TestAttempt) -> dict:
             "raw_max": section_attempt.raw_max,
             "converted_score": section_attempt.converted_score,
             "pending_grading": (
-                section_attempt.status == SectionStatus.COMPLETED
-                and section_attempt.converted_score is None
+                completed and section_attempt.converted_score is None
             ),
             "submission_ids": [
                 link.submission_id for link in section_attempt.submissions.all()
             ],
+            "ai_status": ai_status,
+            "ai_error": ai_error,
+            # Keys and explanations only once the clock has stopped.
+            "submissions": (
+                submission_reviews(section_attempt, request) if completed else []
+            ),
         })
 
     partial = not rows or any(row["converted_score"] is None for row in rows)
@@ -746,5 +773,382 @@ def build_report(attempt: TestAttempt) -> dict:
         "started_at": attempt.started_at,
         "completed_at": attempt.completed_at,
         "sections": rows,
-        "server_time": timezone.now(),
+        "server_time": now,
     }
+
+
+# ---------------------------------------------------------------- AI grading
+# One background grader at a time per process: the NIM-hosted models queue for
+# minutes and start timing out as soon as two calls are in flight together.
+_AI_GATE = threading.Semaphore(1)
+# A `running` section older than this was interrupted (process restart mid-
+# call); it is claimable again and the report shows it as failed.
+AI_STALE_AFTER = timedelta(minutes=20)
+AUTO_ENGINE = "auto"  # artefacts written without a model call
+
+
+def queue_ai_grading(attempt, section_attempt_ids=None, *, sync=None) -> list[int]:
+    """Post-submit hook: claim what is gradable and grade it once the
+    surrounding transaction commits (a rolled-back submit must not grade).
+    Honours ``MOCK_TEST_AI_AUTOGRADE``; the explicit endpoint bypasses it."""
+    if not getattr(settings, "MOCK_TEST_AI_AUTOGRADE", True):
+        return []
+    ids = claim_ai_grading(attempt, section_attempt_ids)
+    if ids:
+        transaction.on_commit(lambda: schedule_ai_grading(ids, sync=sync))
+    return ids
+
+
+def claim_ai_grading(attempt, section_attempt_ids=None) -> list[int]:
+    """Mark every claimable completed section of ``attempt`` as ``running`` and
+    return their ids in section order. Claimable = pending, failed, or running
+    for longer than ``AI_STALE_AFTER``. Row locks (skip_locked) make two
+    concurrent callers split the work instead of both grading a section."""
+    now = timezone.now()
+    with transaction.atomic():
+        qs = SectionAttempt.objects.filter(
+            attempt=attempt, status=SectionStatus.COMPLETED,
+        ).filter(
+            Q(ai_status__in=[AiGradingStatus.PENDING, AiGradingStatus.FAILED])
+            | Q(ai_status=AiGradingStatus.RUNNING,
+                ai_started_at__lt=now - AI_STALE_AFTER)
+        )
+        if section_attempt_ids is not None:
+            qs = qs.filter(pk__in=list(section_attempt_ids))
+        if connection.features.has_select_for_update_skip_locked:
+            qs = qs.select_for_update(skip_locked=True, of=("self",))
+        ids = list(qs.order_by("section__order", "id").values_list("pk", flat=True))
+        if ids:
+            SectionAttempt.objects.filter(pk__in=ids).update(
+                ai_status=AiGradingStatus.RUNNING, ai_started_at=now,
+                ai_finished_at=None, ai_error="",
+            )
+    return ids
+
+
+def schedule_ai_grading(section_attempt_ids, *, sync=None) -> None:
+    """Grade claimed sections now (``sync``) or on a daemon thread. The default
+    follows ``MOCK_TEST_AI_ASYNC`` (off under the test runner)."""
+    ids = list(section_attempt_ids)
+    if not ids:
+        return
+    run_async = (
+        getattr(settings, "MOCK_TEST_AI_ASYNC", False) if sync is None else not sync
+    )
+    if not run_async:
+        with _AI_GATE:
+            run_ai_grading(ids)
+        return
+
+    def worker():
+        try:
+            with _AI_GATE:
+                run_ai_grading(ids)
+        finally:
+            connection.close()  # this thread's own DB connection
+
+    threading.Thread(
+        target=worker, name=f"mock-test-ai-grading-{ids[0]}", daemon=True,
+    ).start()
+
+
+def run_ai_grading(section_attempt_ids) -> None:
+    for pk in section_attempt_ids:
+        try:
+            ai_grade_section(pk)
+        except Exception:  # noqa: BLE001 — a background thread has nobody to re-raise to
+            log.exception("AI grading of section attempt %s crashed", pk)
+            SectionAttempt.objects.filter(
+                pk=pk, ai_status=AiGradingStatus.RUNNING,
+            ).update(
+                ai_status=AiGradingStatus.FAILED, ai_finished_at=timezone.now(),
+                ai_error="AI grading crashed; try again.",
+            )
+
+
+def ai_grade_section(section_attempt_id: int) -> SectionAttempt:
+    """Grade one claimed (``running``) section. Each task is its own unit of
+    failure: one unreachable model reply must not discard the others, so the
+    section ends ``failed`` with the reasons and a retry produces only the
+    artefacts still missing."""
+    section_attempt = (
+        SectionAttempt.objects
+        .select_related("section", "attempt__template__format")
+        .get(pk=section_attempt_id)
+    )
+    if section_attempt.ai_status != AiGradingStatus.RUNNING:
+        return section_attempt  # not claimed (or finished elsewhere)
+
+    receptive = section_attempt.section.skill in RECEPTIVE_SKILLS
+    errors = []
+    links = (
+        section_attempt.submissions
+        .select_related("submission__exercise")
+        .order_by("id")
+    )
+    for link in links:
+        submission = link.submission
+        try:
+            if receptive:
+                ai_explain_receptive(submission)
+            else:
+                ai_grade_productive(submission)
+        except Exception as exc:  # noqa: BLE001 — recorded, surfaced in the report
+            log.warning("AI grading failed for submission %s: %s", submission.pk, exc)
+            errors.append(f"{submission.exercise.title}: {exc}")
+
+    section_attempt.ai_finished_at = timezone.now()
+    if errors:
+        section_attempt.ai_status = AiGradingStatus.FAILED
+        section_attempt.ai_error = "; ".join(errors)[:2000]
+    else:
+        section_attempt.ai_status = AiGradingStatus.DONE
+        section_attempt.ai_error = ""
+    section_attempt.save(update_fields=["ai_status", "ai_finished_at", "ai_error"])
+    return section_attempt
+
+
+def ai_explain_receptive(submission) -> AiInsight:
+    """Store the per-question explanation for a Listening/Reading task as an
+    ``AiInsight`` — the same row the student's "Explain my mistakes" card
+    reads. Idempotent. No model call when there is nothing to explain (every
+    key matched, or nothing was answered), so a perfect section costs nothing."""
+    existing = submission.ai_insights.filter(
+        kind=AiInsightKind.MISTAKE_EXPLANATION
+    ).first()
+    if existing is not None:
+        return existing
+    detail = submission.grade_detail()
+    if not submission.answers:
+        payload = _auto_explanation("No answers were submitted for this part.")
+    elif detail["total"] == 0:
+        payload = _auto_explanation("This part has no auto-marked questions.")
+    elif detail["correct"] == detail["total"]:
+        payload = _auto_explanation(
+            f"All {detail['total']} answers are correct. Nothing to fix here.",
+            strengths=["Every answer matched the key."],
+        )
+    else:
+        from .ai import assist  # the AI layer is consumed here, not depended on
+
+        payload = assist.explain_mistakes(submission)
+    return AiInsight.objects.create(
+        submission=submission,
+        kind=AiInsightKind.MISTAKE_EXPLANATION,
+        payload=payload,
+        engine=payload.get("engine", ""),
+        requested_by=None,
+    )
+
+
+def _auto_explanation(summary: str, strengths=()) -> dict:
+    return {
+        "summary": summary,
+        "mistakes": [],
+        "strengths": list(strengths),
+        "practice_suggestions": [],
+        "engine": AUTO_ENGINE,
+    }
+
+
+def ai_grade_productive(submission) -> Feedback | None:
+    """Grade a Writing/Speaking task with the AI backend exactly as a teacher's
+    "Request AI feedback" does: one AI Feedback row, which
+    :func:`on_feedback_created` converts into the section band. Skipped when
+    any feedback already exists — a teacher's mark must not be overridden. An
+    empty response scores 0 without a model call."""
+    if submission.feedback.exists():
+        return None
+    if submission.submission_type == SubmissionType.SPEAKING:
+        has_response = bool(submission.audio_recording_url)
+    else:
+        has_response = bool((submission.writing_text or "").strip())
+    if not has_response:
+        feedback = Feedback.objects.create(
+            submission=submission,
+            reviewer=None,
+            is_ai_generated=True,
+            score=Decimal("0"),
+            comments=(
+                f"[AI · {AUTO_ENGINE}] No response was submitted for this "
+                "task, so it scores 0."
+            ),
+        )
+        submission.status = SubmissionStatus.AI_GRADED
+        submission.save(update_fields=["status"])
+        on_feedback_created(feedback)
+        return feedback
+
+    from .ai import evaluate_submission  # consumed, not depended on
+
+    return evaluate_submission(submission)
+
+
+# ---------------------------------------------------------------- report detail
+def ai_state(section_attempt, now=None) -> tuple[str, str]:
+    """``(ai_status, ai_error)`` as the report shows them: a ``running``
+    section whose worker never came back is reported as failed so the UI can
+    offer a retry (and :func:`claim_ai_grading` will accept it)."""
+    now = now or timezone.now()
+    if (
+        section_attempt.ai_status == AiGradingStatus.RUNNING
+        and section_attempt.ai_started_at
+        and section_attempt.ai_started_at < now - AI_STALE_AFTER
+    ):
+        return AiGradingStatus.FAILED, "AI grading was interrupted. Try again."
+    return section_attempt.ai_status, section_attempt.ai_error or ""
+
+
+def submission_reviews(section_attempt, request=None) -> list[dict]:
+    """Per-task detail for a completed section: a question-by-question review
+    for Listening/Reading (key, the student's answer, the AI's explanation of
+    each mistake) and the newest feedback for Writing/Speaking. ``audio_url``
+    is the playable (signed) form of a stored Speaking recording — the raw
+    ``audio_recording_url`` is a bare MEDIA path, which an <audio> tag cannot
+    fetch (core/media.py)."""
+    receptive = section_attempt.section.skill in RECEPTIVE_SKILLS
+    number = 1
+    rows = []
+    links = (
+        section_attempt.submissions
+        .select_related("submission__exercise")
+        .order_by("id")
+    )
+    for link in links:
+        submission = link.submission
+        exercise = submission.exercise
+        row = {
+            "submission_id": submission.id,
+            "exercise_id": exercise.id,
+            "exercise_title": exercise.title,
+            "exercise_type": exercise.exercise_type,
+            "ai_status": "pending",
+            "questions": [],
+            "explanation": None,
+            "feedback": None,
+            "writing_text": None,
+            "audio_recording_url": None,
+            "audio_url": None,
+        }
+        if receptive:
+            insight = submission.ai_insights.filter(
+                kind=AiInsightKind.MISTAKE_EXPLANATION
+            ).first()
+            row["questions"], number = question_reviews(submission, insight, number)
+            if insight is not None:
+                payload = insight.payload if isinstance(insight.payload, dict) else {}
+                row["explanation"] = {
+                    "summary": payload.get("summary") or "",
+                    "strengths": _strings(payload.get("strengths")),
+                    "practice_suggestions": _strings(payload.get("practice_suggestions")),
+                    "engine": insight.engine or payload.get("engine") or "",
+                    "created_at": insight.created_at,
+                }
+                row["ai_status"] = "done"
+        else:
+            feedback = submission.feedback.order_by("-created_at", "-id").first()
+            row["writing_text"] = submission.writing_text
+            row["audio_recording_url"] = submission.audio_recording_url
+            if submission.audio_recording_url:
+                row["audio_url"] = (
+                    media.signed_url(submission.audio_recording_url, request)
+                    or submission.audio_recording_url  # external link: pass through
+                )
+            if feedback is not None:
+                row["feedback"] = {
+                    "id": feedback.id,
+                    "score": feedback.score,
+                    "comments": feedback.comments,
+                    "is_ai_generated": feedback.is_ai_generated,
+                    "created_at": feedback.created_at,
+                }
+                row["ai_status"] = "done"
+        rows.append(row)
+    return rows
+
+
+_QUESTION_NUMBER_RE = re.compile(r"(\d+)")
+
+
+def question_reviews(submission, insight, start_number: int = 1) -> tuple[list[dict], int]:
+    """Question rows for one receptive task, with the stored explanation of
+    each mistake attached by ``question_id`` — falling back to the "Question
+    N" the model wrote in ``location``, then to listing order."""
+    from .ai.assist import receptive_breakdown  # consumed, not depended on
+
+    breakdown = receptive_breakdown(submission)
+    mistakes = []
+    if insight is not None and isinstance(insight.payload, dict):
+        mistakes = [
+            m for m in insight.payload.get("mistakes") or [] if isinstance(m, dict)
+        ]
+    by_question: dict = {}
+    loose = []
+    for mistake in mistakes:
+        qid = mistake.get("question_id")
+        if isinstance(qid, int) and not isinstance(qid, bool):
+            by_question.setdefault(qid, mistake)
+        else:
+            loose.append(mistake)
+
+    rows = []
+    for index, question in enumerate(breakdown):
+        number = start_number + index
+        mistake = by_question.get(question["question_id"])
+        if mistake is None and question.get("is_correct") is False and loose:
+            mistake = _take_loose_mistake(loose, question, number)
+        mistake = mistake or {}
+        rows.append({
+            "question_id": question["question_id"],
+            "number": number,
+            "question": question["question"],
+            "options": [str(o) for o in question.get("options") or []],
+            "correct": [
+                str(x) for x in (
+                    question.get("correct_options")
+                    or question.get("correct_answers")
+                    or []
+                )
+            ],
+            "student_answer": _display_answer(question.get("student_answer")),
+            "is_correct": question.get("is_correct"),
+            "explanation": mistake.get("explanation") or None,
+            "tip": mistake.get("tip") or None,
+            "category": mistake.get("category") or None,
+        })
+    return rows, start_number + len(breakdown)
+
+
+def _take_loose_mistake(loose: list, question: dict, number: int) -> dict:
+    """Pop the loose mistake whose "Question N" names this row, else the first
+    one — models list mistakes in question order."""
+    order = question.get("order")
+    wanted = {str(number), str(order), str((order or 0) + 1)}
+    for index, mistake in enumerate(loose):
+        found = _QUESTION_NUMBER_RE.search(str(mistake.get("location") or ""))
+        if found and found.group(1) in wanted:
+            return loose.pop(index)
+    return loose.pop(0)
+
+
+def _strings(values) -> list[str]:
+    return [v for v in (values or []) if isinstance(v, str)] if isinstance(values, list) else []
+
+
+def _display_answer(value):
+    """A student's answer as one string: chosen options join, fill-blank
+    answers arrive as a JSON array string, anything empty is ``None``."""
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        parts = [str(v).strip() for v in value if str(v).strip()]
+        return ", ".join(parts) or None
+    text = str(value).strip()
+    if text.startswith("["):
+        try:
+            parsed = json.loads(text)
+        except ValueError:
+            parsed = None
+        if isinstance(parsed, list):
+            return _display_answer(parsed)
+    return text or None
