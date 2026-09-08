@@ -41,8 +41,6 @@ from .models import (
     SectionStatus,
     SectionSubmission,
     Submission,
-    SubmissionStatus,
-    SubmissionType,
     TestAttempt,
     TestFormat,
     TestSection,
@@ -784,7 +782,6 @@ _AI_GATE = threading.Semaphore(1)
 # A `running` section older than this was interrupted (process restart mid-
 # call); it is claimable again and the report shows it as failed.
 AI_STALE_AFTER = timedelta(minutes=20)
-AUTO_ENGINE = "auto"  # artefacts written without a model call
 
 
 def queue_ai_grading(attempt, section_attempt_ids=None, *, sync=None) -> list[int]:
@@ -911,26 +908,28 @@ def ai_grade_section(section_attempt_id: int) -> SectionAttempt:
 def ai_explain_receptive(submission) -> AiInsight:
     """Store the per-question explanation for a Listening/Reading task as an
     ``AiInsight`` — the same row the student's "Explain my mistakes" card
-    reads. Idempotent. No model call when there is nothing to explain (every
-    key matched, or nothing was answered), so a perfect section costs nothing."""
+    reads. Idempotent. No model call when there is nothing to explain (nothing
+    answered, no answer key, or every key matched), so a blank or perfect
+    section costs nothing."""
     existing = submission.ai_insights.filter(
         kind=AiInsightKind.MISTAKE_EXPLANATION
     ).first()
     if existing is not None:
         return existing
+
+    from .ai import assist  # the AI layer is consumed here, not depended on
+
     detail = submission.grade_detail()
-    if not submission.answers:
-        payload = _auto_explanation("No answers were submitted for this part.")
+    if not submission.has_response():
+        payload = assist.instant_explanation("No answers were submitted for this part.")
     elif detail["total"] == 0:
-        payload = _auto_explanation("This part has no auto-marked questions.")
+        payload = assist.instant_explanation("This part has no auto-marked questions.")
     elif detail["correct"] == detail["total"]:
-        payload = _auto_explanation(
+        payload = assist.instant_explanation(
             f"All {detail['total']} answers are correct. Nothing to fix here.",
             strengths=["Every answer matched the key."],
         )
     else:
-        from .ai import assist  # the AI layer is consumed here, not depended on
-
         payload = assist.explain_mistakes(submission)
     return AiInsight.objects.create(
         submission=submission,
@@ -941,43 +940,14 @@ def ai_explain_receptive(submission) -> AiInsight:
     )
 
 
-def _auto_explanation(summary: str, strengths=()) -> dict:
-    return {
-        "summary": summary,
-        "mistakes": [],
-        "strengths": list(strengths),
-        "practice_suggestions": [],
-        "engine": AUTO_ENGINE,
-    }
-
-
 def ai_grade_productive(submission) -> Feedback | None:
     """Grade a Writing/Speaking task with the AI backend exactly as a teacher's
     "Request AI feedback" does: one AI Feedback row, which
     :func:`on_feedback_created` converts into the section band. Skipped when
     any feedback already exists — a teacher's mark must not be overridden. An
-    empty response scores 0 without a model call."""
+    empty response scores 0 on the spot (core/ai/service.py:instant_result)."""
     if submission.feedback.exists():
         return None
-    if submission.submission_type == SubmissionType.SPEAKING:
-        has_response = bool(submission.audio_recording_url)
-    else:
-        has_response = bool((submission.writing_text or "").strip())
-    if not has_response:
-        feedback = Feedback.objects.create(
-            submission=submission,
-            reviewer=None,
-            is_ai_generated=True,
-            score=Decimal("0"),
-            comments=(
-                f"[AI · {AUTO_ENGINE}] No response was submitted for this "
-                "task, so it scores 0."
-            ),
-        )
-        submission.status = SubmissionStatus.AI_GRADED
-        submission.save(update_fields=["status"])
-        on_feedback_created(feedback)
-        return feedback
 
     from .ai import evaluate_submission  # consumed, not depended on
 

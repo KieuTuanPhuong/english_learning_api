@@ -2205,7 +2205,7 @@ class AiCoachingTests(APITransactionTestCase):
         self._login(self.student)
         self.assertEqual(self.client.get(url).status_code, 200)
 
-    def test_speaking_and_empty_submissions_rejected(self):
+    def test_speaking_needs_live_backend_and_empty_is_explained_instantly(self):
         speaking_ex = Exercise.objects.create(
             module=self.module, title="S", exercise_type=ExerciseType.SPEAKING,
             prompt_text="Talk.", created_by=self.teacher)
@@ -2215,12 +2215,17 @@ class AiCoachingTests(APITransactionTestCase):
             audio_recording_url="https://example.com/a.webm")
         empty = Submission.objects.create(
             exercise=self.writing_ex, student=self.student,
-            submission_type=SubmissionType.WRITING, writing_text="")
+            submission_type=SubmissionType.WRITING, writing_text="   ")
         self._login(self.student)
         self.assertEqual(
             self.client.post(f"/api/submissions/{speaking.id}/ai-explain/").status_code, 400)
-        self.assertEqual(
-            self.client.post(f"/api/submissions/{empty.id}/ai-explain/").status_code, 400)
+        # Nothing to analyse -> an instant, stored explanation rather than an error.
+        resp = self.client.post(f"/api/submissions/{empty.id}/ai-explain/")
+        self.assertEqual(resp.status_code, 201, resp.data)
+        self.assertEqual(resp.data["engine"], "auto")
+        self.assertEqual(resp.data["payload"]["mistakes"], [])
+        self.assertIn("No response", resp.data["payload"]["summary"])
+        self.assertEqual(AiInsight.objects.filter(submission=empty).count(), 1)
 
     def test_gemini_failure_maps_to_502(self):
         from unittest import mock
@@ -3166,3 +3171,185 @@ class MockTestAiGradingTests(APITransactionTestCase):
         reading = attempt.sections.get(section__order=0)
         self.assertEqual(reading.ai_status, _AiGradingStatus.PENDING)
         self.assertFalse(AiInsight.objects.exists())
+
+
+# ==================== Instant results: no model call for empty / key-marked work ====================
+class InstantGradingTests(APITransactionTestCase):
+    """An empty submission never reaches a model — every AI path answers it on
+    the spot — and a receptive submission with an answer key is marked by the
+    key. Proven against the *live* backend selection with the provider client
+    patched, so a regression that starts calling the model fails loudly."""
+
+    def setUp(self):
+        self.teacher = User.objects.create_user(
+            email="ig-t@test.app", password="password123", full_name="T",
+            role=UserRole.TEACHER)
+        self.student = User.objects.create_user(
+            email="ig-s@test.app", password="password123", full_name="S",
+            role=UserRole.STUDENT)
+        module = LearningModule.objects.create(title="IG", created_by=self.teacher)
+        self.writing_ex = Exercise.objects.create(
+            module=module, title="Essay", exercise_type=ExerciseType.WRITING,
+            prompt_text="Write.", created_by=self.teacher)
+        self.speaking_ex = Exercise.objects.create(
+            module=module, title="Talk", exercise_type=ExerciseType.SPEAKING,
+            prompt_text="Talk.", created_by=self.teacher)
+        self.quiz_ex = Exercise.objects.create(
+            module=module, title="Quiz", exercise_type=ExerciseType.QUIZ,
+            prompt_text="Pick.", created_by=self.teacher)
+        self.q1 = Question.objects.create(exercise=self.quiz_ex, text="One?", order=0)
+        self.q1_right = QuestionOption.objects.create(question=self.q1, text="yes", is_correct=True, order=0)
+        self.q1_wrong = QuestionOption.objects.create(question=self.q1, text="no", order=1)
+        self.q2 = Question.objects.create(exercise=self.quiz_ex, text="Capital: [[Paris]].", order=1)
+
+    def _login(self, user):
+        resp = self.client.post(reverse("login"), {"email": user.email, "password": "password123"})
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {resp.data['access_token']}")
+
+    def _submission(self, exercise, **fields):
+        return Submission.objects.create(
+            exercise=exercise, student=self.student,
+            submission_type=exercise.exercise_type, **fields)
+
+    def _evaluate_live(self, submission):
+        """POST ai-evaluate with the live backend selected and the provider
+        client patched: returns (response, provider mock)."""
+        from unittest import mock
+        self._login(self.teacher)
+        with override_settings(AI_BACKEND="gemini", GEMINI_API_KEY="k"), mock.patch(
+                "core.ai.backends.llm.generate_json") as call:
+            resp = self.client.post(f"/api/submissions/{submission.id}/ai-evaluate/")
+        return resp, call
+
+    # ---- the rule itself ----
+    def test_has_response_rules(self):
+        self.assertFalse(self._submission(self.writing_ex, writing_text="  \n ").has_response())
+        self.assertTrue(self._submission(self.writing_ex, writing_text="An essay.").has_response())
+        self.assertFalse(self._submission(self.speaking_ex, audio_recording_url="").has_response())
+        self.assertTrue(self._submission(self.speaking_ex, audio_recording_url="/media/a.webm").has_response())
+        blank = {"version": 1, "responses": [
+            {"question_id": self.q1.id, "type": "mcq"},
+            {"question_id": self.q2.id, "type": "fill_blank", "text": '["", " "]'},
+        ]}
+        self.assertFalse(self._submission(self.quiz_ex, answers=blank).has_response())
+        self.assertFalse(self._submission(self.quiz_ex, answers=None).has_response())
+        answered = {"version": 1, "responses": [
+            {"question_id": self.q2.id, "type": "fill_blank", "text": '["", "paris"]'},
+        ]}
+        self.assertTrue(self._submission(self.quiz_ex, answers=answered).has_response())
+
+    # ---- grading ----
+    def test_empty_writing_is_scored_zero_without_the_model(self):
+        sub = self._submission(self.writing_ex, writing_text="")
+        resp, call = self._evaluate_live(sub)
+        self.assertEqual(resp.status_code, 201, resp.data)
+        call.assert_not_called()
+        self.assertEqual(resp.data["score"], "0.00")
+        self.assertTrue(resp.data["is_ai_generated"])
+        self.assertIn("No response was submitted", resp.data["comments"])
+        sub.refresh_from_db()
+        self.assertEqual(sub.status, SubmissionStatus.AI_GRADED)
+
+    def test_missing_recording_is_scored_zero_without_the_model(self):
+        sub = self._submission(self.speaking_ex, audio_recording_url="")
+        resp, call = self._evaluate_live(sub)
+        self.assertEqual(resp.status_code, 201, resp.data)  # used to be a 400
+        call.assert_not_called()
+        self.assertEqual(resp.data["score"], "0.00")
+
+    def test_keyed_quiz_is_marked_by_the_key_without_the_model(self):
+        sub = self._submission(self.quiz_ex, answers={"version": 1, "responses": [
+            {"question_id": self.q1.id, "type": "mcq", "option_id": self.q1_wrong.id},
+            {"question_id": self.q2.id, "type": "fill_blank", "text": '["Paris"]'},
+        ]})
+        resp, call = self._evaluate_live(sub)
+        self.assertEqual(resp.status_code, 201, resp.data)
+        call.assert_not_called()
+        self.assertEqual(resp.data["score"], "50.00")
+        self.assertIn("1 of 2 correct", resp.data["comments"])
+        sub.refresh_from_db()
+        self.assertEqual(sub.auto_score, Decimal("50.00"))
+
+    def test_blank_quiz_answers_score_zero_instantly(self):
+        sub = self._submission(self.quiz_ex, answers={"version": 1, "responses": [
+            {"question_id": self.q1.id, "type": "mcq"},
+            {"question_id": self.q2.id, "type": "fill_blank", "text": '[""]'},
+        ]})
+        resp, call = self._evaluate_live(sub)
+        self.assertEqual(resp.status_code, 201, resp.data)
+        call.assert_not_called()
+        self.assertEqual(resp.data["score"], "0.00")
+
+    def test_student_practice_with_nothing_is_instant(self):
+        from unittest import mock
+        self._login(self.student)
+        with override_settings(AI_BACKEND="gemini", GEMINI_API_KEY="k"), mock.patch(
+                "core.ai.backends.llm.generate_json") as call:
+            resp = self.client.post(reverse("submission-ai-practice"), {
+                "exercise_id": self.writing_ex.id, "writing_text": "",
+            }, format="json")
+        self.assertEqual(resp.status_code, 201, resp.data)
+        call.assert_not_called()
+        self.assertEqual(resp.data["feedback"]["score"], "0.00")
+
+    def test_speaking_service_shortcut_returns_the_same_shape(self):
+        from core.ai.service import transcribe_and_score_speaking
+        sub = self._submission(self.speaking_ex, audio_recording_url="")
+        result = transcribe_and_score_speaking(sub)
+        self.assertEqual(result["score"], "0.00")
+        self.assertEqual(result["transcript"], "")
+        self.assertIn("No response", result["comments"])
+        self.assertEqual(sub.feedback.count(), 1)
+
+    def test_real_content_still_reaches_the_model(self):
+        from unittest import mock
+        sub = self._submission(self.writing_ex, writing_text="Yesterday I go to school.")
+        self._login(self.teacher)
+        with override_settings(AI_BACKEND="gemini", GEMINI_API_KEY="k"), mock.patch(
+                "core.ai.backends.llm.generate_json",
+                return_value={"score": 61, "comments": "ok", "criteria": [], "engine": "gemini:x"}) as call:
+            resp = self.client.post(f"/api/submissions/{sub.id}/ai-evaluate/")
+        self.assertEqual(resp.status_code, 201, resp.data)
+        call.assert_called_once()
+        self.assertEqual(resp.data["score"], "61.00")
+
+    # ---- coaching + mock tests ----
+    def test_explain_mistakes_on_blank_answers_is_instant(self):
+        from unittest import mock
+        sub = self._submission(self.quiz_ex, answers={"version": 1, "responses": [
+            {"question_id": self.q1.id, "type": "mcq"},
+        ]})
+        self._login(self.student)
+        with override_settings(AI_ASSIST_BACKEND="llm", GEMINI_API_KEY="k"), mock.patch(
+                "core.ai.assist.llm.generate_json") as call:
+            resp = self.client.post(f"/api/submissions/{sub.id}/ai-explain/")
+        self.assertEqual(resp.status_code, 201, resp.data)
+        call.assert_not_called()
+        self.assertEqual(resp.data["engine"], "auto")
+        self.assertEqual(resp.data["payload"]["mistakes"], [])
+
+    @override_settings(AI_BACKEND="mock", AI_ASSIST_BACKEND="mock",
+                       MOCK_TEST_AI_AUTOGRADE=True, MOCK_TEST_AI_ASYNC=False)
+    def test_blank_mock_test_reading_part_needs_no_model(self):
+        from unittest import mock
+        fmt = TestFormat.objects.create(
+            slug="custom_ig", name="Custom", version="1",
+            overall_strategy=OverallStrategy.MEAN_PERCENT, score_precision="0.01")
+        template = MockTestTemplate.objects.create(format=fmt, title="IG test", created_by=self.teacher)
+        section = TestSection.objects.create(
+            template=template, skill=SectionSkill.READING, title="R", order=0, duration_minutes=10)
+        TestSectionExercise.objects.create(section=section, exercise=self.quiz_ex, order=0)
+        attempt = mock_tests.start_attempt(template, self.student)
+        reading = attempt.sections.get()
+        mock_tests.start_section(attempt, reading.id)
+        with mock.patch("core.ai.assist.MockAssistBackend.explain_mistakes") as call:
+            mock_tests.submit_section(attempt, reading.id, draft={
+                "answers": {str(self.quiz_ex.id): {"version": 1, "responses": [
+                    {"question_id": self.q1.id, "type": "mcq"}]}},
+                "writing": {}, "meta": {}})
+        call.assert_not_called()
+        reading.refresh_from_db()
+        self.assertEqual(reading.ai_status, "done")
+        insight = reading.submissions.get().submission.ai_insights.get()
+        self.assertEqual(insight.engine, "auto")
+        self.assertIn("No answers were submitted", insight.payload["summary"])
