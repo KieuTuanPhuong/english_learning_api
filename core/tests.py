@@ -3031,7 +3031,32 @@ class MockTestAiGradingTests(APITransactionTestCase):
         self.assertTrue(task["feedback"]["is_ai_generated"])
         self.assertEqual(task["feedback"]["score"], str(feedback.score))
         self.assertEqual(task["writing_text"], submission.writing_text)
+        self.assertIsNone(task["audio_url"])
         self.assertEqual(task["questions"], [])
+
+    def test_speaking_recording_is_served_through_a_signed_link(self):
+        speaking_ex = Exercise.objects.create(
+            module=self.writing_ex.module, title="Part 1",
+            exercise_type=ExerciseType.SPEAKING, prompt_text="Talk.",
+            created_by=self.teacher,
+        )
+        section = TestSection.objects.create(
+            template=self.template, skill=SectionSkill.SPEAKING, title="Speaking",
+            order=2, duration_minutes=14,
+        )
+        TestSectionExercise.objects.create(section=section, exercise=speaking_ex, order=0)
+        attempt = mock_tests.start_attempt(self.template, self.student, mode="practice")
+        speaking = attempt.sections.get(section__order=2)
+        mock_tests.start_section(attempt, speaking.id)
+        mock_tests.submit_section(
+            attempt, speaking.id, draft={},
+            recordings={str(speaking_ex.id): "/media/mock-tests/2026/09/answer.webm"},
+        )
+        self._login(self.student)
+        task = self._report(attempt)["sections"][2]["submissions"][0]
+        self.assertEqual(task["audio_recording_url"], "/media/mock-tests/2026/09/answer.webm")
+        self.assertTrue(task["audio_url"].startswith("http://testserver/media/mock-tests/2026/09/answer.webm?t="))
+        self.assertTrue(task["feedback"]["is_ai_generated"])  # mock engine graded it
 
     def test_empty_writing_scores_zero_without_a_model_call(self):
         attempt = self._sit(reading_option=self.q1_right, writing_text="   ")

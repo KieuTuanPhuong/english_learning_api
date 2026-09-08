@@ -1052,6 +1052,8 @@ class SubmissionReviewSerializer(serializers.Serializer):
     feedback = ReportFeedbackSerializer(allow_null=True)
     writing_text = serializers.CharField(allow_null=True, allow_blank=True)
     audio_recording_url = serializers.CharField(allow_null=True, allow_blank=True)
+    # Signed, playable form of the recording (see SubmissionSerializer.audio_url).
+    audio_url = serializers.CharField(allow_null=True, allow_blank=True)
 
 
 class SectionScoreSerializer(serializers.Serializer):

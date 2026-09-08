@@ -20,6 +20,7 @@ from django.db import connection, transaction
 from django.db.models import Q
 from django.utils import timezone
 
+from . import media
 from .models import (
     AiGradingStatus,
     AiInsight,
@@ -721,9 +722,10 @@ def _get_section_attempt(attempt: TestAttempt, section_attempt_id: int) -> Secti
     return section_attempt
 
 
-def build_report(attempt: TestAttempt) -> dict:
+def build_report(attempt: TestAttempt, request=None) -> dict:
     """Score-report payload. ``partial`` is true while any section is missing a
-    converted score (typically Writing/Speaking awaiting grading)."""
+    converted score (typically Writing/Speaking awaiting grading). ``request``
+    makes the signed audio links absolute (core/media.py)."""
     sections = list(
         attempt.sections.select_related("section").order_by("section__order", "id")
     )
@@ -751,7 +753,9 @@ def build_report(attempt: TestAttempt) -> dict:
             "ai_status": ai_status,
             "ai_error": ai_error,
             # Keys and explanations only once the clock has stopped.
-            "submissions": submission_reviews(section_attempt) if completed else [],
+            "submissions": (
+                submission_reviews(section_attempt, request) if completed else []
+            ),
         })
 
     partial = not rows or any(row["converted_score"] is None for row in rows)
@@ -995,10 +999,13 @@ def ai_state(section_attempt, now=None) -> tuple[str, str]:
     return section_attempt.ai_status, section_attempt.ai_error or ""
 
 
-def submission_reviews(section_attempt) -> list[dict]:
+def submission_reviews(section_attempt, request=None) -> list[dict]:
     """Per-task detail for a completed section: a question-by-question review
     for Listening/Reading (key, the student's answer, the AI's explanation of
-    each mistake) and the newest feedback for Writing/Speaking."""
+    each mistake) and the newest feedback for Writing/Speaking. ``audio_url``
+    is the playable (signed) form of a stored Speaking recording — the raw
+    ``audio_recording_url`` is a bare MEDIA path, which an <audio> tag cannot
+    fetch (core/media.py)."""
     receptive = section_attempt.section.skill in RECEPTIVE_SKILLS
     number = 1
     rows = []
@@ -1021,6 +1028,7 @@ def submission_reviews(section_attempt) -> list[dict]:
             "feedback": None,
             "writing_text": None,
             "audio_recording_url": None,
+            "audio_url": None,
         }
         if receptive:
             insight = submission.ai_insights.filter(
@@ -1041,6 +1049,11 @@ def submission_reviews(section_attempt) -> list[dict]:
             feedback = submission.feedback.order_by("-created_at", "-id").first()
             row["writing_text"] = submission.writing_text
             row["audio_recording_url"] = submission.audio_recording_url
+            if submission.audio_recording_url:
+                row["audio_url"] = (
+                    media.signed_url(submission.audio_recording_url, request)
+                    or submission.audio_recording_url  # external link: pass through
+                )
             if feedback is not None:
                 row["feedback"] = {
                     "id": feedback.id,
