@@ -422,6 +422,23 @@ def normalize_answers(answers) -> dict:
     return out
 
 
+def answer_text_present(text) -> bool:
+    """True when a free-text or fill-blank answer contains anything. Blanks
+    arrive as a JSON array of strings (``FillBlankInput``), so ``'["", ""]'``
+    is as empty as ``""``."""
+    if not isinstance(text, str) or not text.strip():
+        return False
+    stripped = text.strip()
+    if stripped.startswith("["):
+        try:
+            parsed = json.loads(stripped)
+        except ValueError:
+            return True
+        if isinstance(parsed, list):
+            return any(str(item).strip() for item in parsed)
+    return True
+
+
 _WHITESPACE_RE = re.compile(r"\s+")
 _LEADING_ARTICLE_RE = re.compile(r"^(?:a|an|the)\s+")
 _EDGE_PUNCTUATION = " .,;:!?\"'“”‘’"
@@ -576,6 +593,19 @@ class Submission(models.Model):
             Decimal(100 * detail["correct"]) / Decimal(detail["total"])
         ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
         return self.auto_score
+
+    def has_response(self) -> bool:
+        """False when the student submitted nothing gradable: no essay text, no
+        recording, and no answered question (blank fill-ins count as
+        unanswered). Every AI path — grading, coaching, mock-test marking —
+        answers such a submission on the spot instead of calling a model
+        (core/ai/service.py:instant_result)."""
+        if (self.writing_text or "").strip() or self.audio_recording_url:
+            return True
+        return any(
+            given.get("option_ids") or answer_text_present(given.get("text"))
+            for given in normalize_answers(self.answers).values()
+        )
 
 
 class Feedback(models.Model):

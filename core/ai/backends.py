@@ -194,6 +194,28 @@ _SPEAKING_SYSTEM = _GRADER_SYSTEM + textwrap.dedent("""
 """)
 
 
+def _response_text(submission) -> str:
+    """What the grader reads: the essay, or — for a receptive task whose open
+    questions the answer key cannot mark — the student's answers per question.
+    Empty submissions never reach a backend (core/ai/service.py answers them
+    instantly), so running out of material here is a caller bug."""
+    text = (submission.writing_text or "").strip()
+    if text:
+        return text[:12000]
+    if submission.answers:
+        from .assist import receptive_breakdown  # lazy: sibling module
+
+        rows = [
+            {"question": row["question"], "student_answer": row.get("student_answer")}
+            for row in receptive_breakdown(submission)
+        ]
+        return (
+            "The student's answers, per question (JSON):\n"
+            + json.dumps(rows, ensure_ascii=False, indent=1)[:12000]
+        )
+    raise ValueError("Submission has no writing_text to grade")
+
+
 class LlmBackend(BaseAIBackend):
     """Live grading through the configured LLM provider (``core/ai/llm.py``).
     Text -> ``AI_GRADING_MODEL``; audio -> Gemini."""
@@ -245,12 +267,10 @@ class LlmBackend(BaseAIBackend):
         return {"score": score, "comments": f"[AI · {engine}] {comments}", "criteria": criteria}
 
     def grade_writing(self, submission) -> dict:
-        text = (submission.writing_text or "").strip()
-        if not text:
-            raise ValueError("Submission has no writing_text to grade")
+        text = _response_text(submission)
         user = (
             "TASK (JSON):\n" + json.dumps(self._task(submission), ensure_ascii=False, indent=1)
-            + "\n\nSTUDENT RESPONSE:\n" + text[:12000]
+            + "\n\nSTUDENT RESPONSE:\n" + text
         )
         data = llm.generate_json(
             "grading", system=_GRADER_SYSTEM, user=user, schema=_GRADE_SCHEMA,

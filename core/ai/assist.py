@@ -36,6 +36,7 @@ from ..models import (
 from . import gemini, llm
 
 _MAX_TEXT = 6000  # chars of student text sent to the model
+AUTO_ENGINE = "auto"  # results produced without a model call (see instant_explanation)
 
 MISTAKE_CATEGORIES = [
     "grammar", "vocabulary", "spelling", "punctuation", "coherence",
@@ -388,6 +389,18 @@ GeminiAssistBackend = LlmAssistBackend  # backwards-compatible name
 
 
 # --------------------------------------------------------------- public API
+def instant_explanation(summary: str, *, strengths=(), practice_suggestions=()) -> dict:
+    """A MISTAKES_SCHEMA-shaped result written without a model call — for the
+    cases a model could only restate: nothing submitted, or nothing wrong."""
+    return {
+        "summary": summary,
+        "mistakes": [],
+        "strengths": list(strengths),
+        "practice_suggestions": list(practice_suggestions),
+        "engine": AUTO_ENGINE,
+    }
+
+
 def review_feedback(submission, *, score=None, comments="", criterion_scores=None) -> dict:
     """Review a teacher's (draft) feedback on ``submission``. ``criterion_scores``
     is a list of ``{"criterion": <RubricCriterion>|code, "score", "note"}``.
@@ -416,20 +429,25 @@ def review_feedback(submission, *, score=None, comments="", criterion_scores=Non
 
 
 def explain_mistakes(submission) -> dict:
-    """Explain the mistakes in ``submission``. Speaking submissions have no
-    transcript to analyse yet, so they are rejected with ``ValueError``."""
-    if submission.submission_type == SubmissionType.SPEAKING:
-        if not submission.audio_recording_url:
-            raise ValueError("This speaking submission has no recording to analyse.")
-        if get_assist_backend().name != "llm":
-            raise ValueError(
-                "Mistake explanation for speaking needs a live backend "
-                "(AI_ASSIST_BACKEND=llm) to transcribe the recording."
-            )
-    if submission.submission_type == SubmissionType.WRITING and not (submission.writing_text or "").strip():
-        raise ValueError("This writing submission has no text to analyse.")
-    if submission.submission_type not in (SubmissionType.WRITING, SubmissionType.SPEAKING) and not submission.answers:
-        raise ValueError("This submission has no answers to analyse.")
+    """Explain the mistakes in ``submission``. An empty submission (no text,
+    recording or answered question) is answered on the spot — there is nothing
+    for a model to look at. Speaking needs a live backend to transcribe the
+    recording and is rejected with ``ValueError`` on the mock one."""
+    if not submission.has_response():
+        return instant_explanation(
+            "No response was submitted, so there is nothing to explain yet.",
+            practice_suggestions=[
+                "Attempt the task and submit it, then come back for an explanation.",
+            ],
+        )
+    if (
+        submission.submission_type == SubmissionType.SPEAKING
+        and get_assist_backend().name != "llm"
+    ):
+        raise ValueError(
+            "Mistake explanation for speaking needs a live backend "
+            "(AI_ASSIST_BACKEND=llm) to transcribe the recording."
+        )
     ctx = build_context(submission)
     result = get_assist_backend().explain_mistakes(ctx)
     result.setdefault("engine", engine_label())
