@@ -1,0 +1,251 @@
+' English Learning Platform - 3 Highlight Features
+' Render at https://plantuml.com/ (paste one @startuml..@enduml block at a time).
+' Backend : Django + DRF (english-learning-api)
+' Frontend: Next.js + TanStack Query (english-learning-web)
+
+'==================================================================
+' HIGHLIGHT 1 - Server-authoritative mock-test section runner
+' Timing, debounced autosave, expiry, scoring. No exam rule on client.
+'==================================================================
+@startuml mock-test-section-runner
+title Highlight 1 - Mock-test section runner (server-authoritative clock + autosave)
+autonumber
+
+actor Student
+participant "SectionRunner\n(components/mock-test)" as UI
+participant "useDebouncedSave\n(3s delay / 10s maxWait)" as Deb
+participant "api.ts" as API
+participant "TestAttemptViewSet\n(core/views.py)" as View
+participant "mock_tests.py\n(engine)" as Eng
+database "SectionAttempt\nSubmission" as DB
+participant "expire_section_attempts\n(cron command)" as Cron
+
+== Start the clock ==
+Student -> UI : click "Start section"
+UI -> API : startSection(attemptId, sectionAttemptId)
+API -> View : POST /sections/{sid}/start/
+View -> Eng : start_section(attempt, sid)
+Eng -> DB : SELECT ... FOR UPDATE (attempt row)
+note right of Eng
+  Rules enforced here, never on client:
+  * attempt still IN_PROGRESS
+  * only one section running at a time
+  * EXAM mode -> lower-order sections done
+  * idempotent: re-start returns live clock
+end note
+Eng -> DB : started_at = now\nexpires_at = now + duration + GRACE(30s)
+DB --> Eng : SectionAttempt
+Eng --> View : SectionAttempt
+View --> API : 200 {expires_at, server_time, draft_answers}
+API --> UI : section state
+UI -> UI : SectionTimer counts down from\nexpires_at vs server_time (skew-corrected)
+
+== Answering + autosave ==
+loop while section in progress
+  Student -> UI : type / pick answer
+  UI -> Deb : queueSave(draft envelope)
+  Deb -> API : (after debounce) autosaveSection(draft)
+  API -> View : PATCH /sections/{sid}/answers/
+  View -> Eng : autosave(attempt, sid, draft)
+  alt now > expires_at
+    Eng --> View : SectionExpired(code=section_expired)
+    View --> API : 409 section_expired
+    API --> UI : ApiError(409)
+    UI -> UI : lock inputs, stop scheduling saves
+    note right of UI : late write cannot buy time;\nlast accepted draft is what gets graded
+  else still in time
+    Eng -> Eng : normalize_draft + part gating\n(sequential sections)
+    Eng -> DB : replace draft_answers
+    Eng --> View : SectionAttempt
+    View --> API : 200
+    API --> UI : SaveIndicator = "saved"
+  end
+end
+
+Student -> UI : hides tab / closes window
+UI -> Deb : flush()
+Deb -> API : autosaveSection(newest draft)
+
+== Submit ==
+Student -> UI : Submit section
+UI -> Deb : flush()
+UI -> API : submitSection({draft, recordings})
+note right of UI : speaking audio uploaded separately\nand attached here as URLs, not base64
+API -> View : POST /sections/{sid}/submit/
+View -> Eng : submit_section(...)
+Eng -> Eng : _finalize_section()
+loop each exercise in section
+  Eng -> DB : create Submission(answers/writing/audio_url)
+  alt receptive skill (Reading/Listening)
+    Eng -> DB : grade() against answer key
+  end
+end
+Eng -> Eng : convert_score(raw -> band via ScoreConversionTable)
+Eng -> DB : status=COMPLETED, raw_score, converted_score
+Eng -> Eng : _maybe_complete_attempt() -> recompute_overall()
+Eng -> Eng : queue_ai_grading(attempt, [sid])
+note right of Eng : continues in Highlight 2
+Eng --> View : SectionAttempt
+View --> API : 200
+API --> UI : move to next section / report
+
+== Abandoned attempt (no submit) ==
+Cron -> Eng : expire_stale_sections()
+Eng -> DB : find IN_PROGRESS with expires_at < now - SWEEP_AFTER(10m)
+Eng -> Eng : _finalize_section() + queue_ai_grading(sync=True)
+note right of Cron : an abandoned sitting still yields a report
+@enduml
+
+'==================================================================
+' HIGHLIGHT 2 - AI grading pipeline (claim -> background worker -> report)
+'==================================================================
+@startuml mock-test-ai-grading
+title Highlight 2 - AI grading pipeline (claimed work, background worker, poll-to-fresh report)
+autonumber
+
+actor Student
+participant "Report page\n(app/(app)/mock-tests/attempts/[id]/report)" as UI
+participant "TestAttemptViewSet" as View
+participant "mock_tests.py" as Eng
+participant "AI worker thread\n(run_ai_grading)" as Worker
+participant "core/ai/assist.py\ncore/ai/service.py" as AI
+participant "Gemini / NVIDIA / Mock\nbackend" as LLM
+database "SectionAttempt\nAiInsight / Feedback" as DB
+
+== Claim (inside the submit transaction) ==
+Eng -> Eng : queue_ai_grading(attempt, ids)
+alt settings.MOCK_TEST_AI_AUTOGRADE is off
+  Eng --> Eng : return [] (teacher grades manually)
+else autograde on
+  Eng -> DB : claim_ai_grading():\nSELECT FOR UPDATE SKIP LOCKED\nwhere ai_status in (pending, failed,\nrunning older than AI_STALE_AFTER)
+  note right of Eng
+    Row locks make two concurrent callers
+    split the work instead of both grading
+    the same section twice.
+  end note
+  Eng -> DB : ai_status = RUNNING, ai_started_at = now
+  Eng -> Eng : transaction.on_commit(schedule_ai_grading)
+  note right of Eng : a rolled-back submit must not grade
+end
+Eng -> Worker : start daemon thread (MOCK_TEST_AI_ASYNC)
+
+== Grade, one submission at a time ==
+Worker -> Eng : ai_grade_section(sid)
+Eng -> DB : guard: only if ai_status == RUNNING
+loop each submission in the section
+  alt receptive (Reading / Listening)
+    Eng -> Eng : ai_explain_receptive(submission)
+    alt nothing answered / no key / all correct
+      Eng -> AI : instant_explanation(...)
+      note right of AI : zero model calls -\na blank or perfect part costs nothing
+    else has mistakes
+      Eng -> AI : explain_mistakes(submission)
+      AI -> LLM : structured-schema prompt
+      LLM --> AI : per-question explanation JSON
+    end
+    AI --> Eng : payload
+    Eng -> DB : AiInsight(kind=MISTAKE_EXPLANATION)
+  else productive (Writing / Speaking)
+    Eng -> Eng : ai_grade_productive(submission)
+    alt teacher feedback already exists
+      Eng --> Eng : skip (never override a human mark)
+    else
+      Eng -> AI : evaluate_submission(submission)
+      AI -> LLM : rubric-criteria prompt
+      LLM --> AI : score 0-100 + comments
+      AI -> DB : Feedback(is_ai=true)
+      DB -> Eng : on_feedback_created(feedback)
+      Eng -> Eng : weighted mean of the section's tasks\n(TestSectionExercise.weight, e.g. Task2 = 2x Task1)
+      Eng -> Eng : convert_score() -> section band
+      Eng -> Eng : recompute_overall()\n(band_average / scaled_sum / mean_percent)
+      Eng -> DB : converted_score, overall_score
+    end
+  end
+end
+alt any task raised
+  Eng -> DB : ai_status = FAILED + ai_error (reasons kept)
+  note right of Eng : each task is its own unit of failure;\na retry only redoes what is still missing
+else
+  Eng -> DB : ai_status = DONE
+end
+
+== Student watches the report ==
+Student -> UI : open report
+UI -> View : GET /attempts/{id}/report/
+View -> Eng : build_report() + ai_state()
+note right of Eng : a RUNNING section whose worker\nnever returned is reported as failed
+Eng --> View : sections, bands, submission reviews
+View --> UI : 200
+alt any section ai_status == pending
+  UI -> View : POST /attempts/{id}/ai-grade/ (once per page load)
+end
+loop while any section is "running"
+  UI -> View : GET report (refetchInterval 4s)
+  View --> UI : updated ai_status / bands
+end
+UI --> Student : bands, per-question explanations,\nRetry button on failed sections
+@enduml
+
+'==================================================================
+' HIGHLIGHT 3 - Pronunciation drill: record -> upload -> score (one round trip)
+'==================================================================
+@startuml pronunciation-attempt
+title Highlight 3 - Pronunciation drill attempt (browser capture -> pluggable scoring engine)
+autonumber
+
+actor Student
+participant "Drill page + RecorderPanel\n(app/(app)/pronunciation/[drillId])" as UI
+participant "useRecorder\n(MediaRecorder + AnalyserNode)" as Rec
+participant "api.ts\ncreatePronunciationAttempt" as API
+participant "PronunciationDrillViewSet\n.attempts (core/views.py)" as View
+participant "core/audio.py" as Audio
+participant "ai/pronunciation.py\nassess_attempt" as Pron
+participant "Azure / Gemini / Mock\nbackend" as Engine
+database "PronunciationAttempt" as DB
+
+Student -> UI : open drill (target text + IPA)
+UI -> API : listDrillAttempts(drillId)
+API -> View : GET /api/pronunciation/drills/{id}/attempts/
+View --> UI : own attempt history
+
+Student -> Rec : press Record
+Rec -> Rec : getUserMedia({audio})\npickMimeType() webm/opus or mp4/aac
+Rec -> UI : live level meter (AnalyserNode)
+Student -> Rec : press Stop
+Rec --> UI : Recording {blob, mimeType, durationMs}
+
+UI -> API : createPronunciationAttempt(drillId, blob, mimeType)
+API -> View : POST .../attempts/ (multipart/form-data)
+View -> View : PronunciationAttemptThrottle\n30 recordings / hour / student
+View -> View : role must be STUDENT
+View -> Audio : validate_upload(file)
+Audio -> Audio : size cap, content-type family,\nffprobe duration cap
+alt rejected
+  Audio --> View : ValidationError
+  View --> API : 400
+  API --> UI : show reason, keep the recording
+else accepted
+  View -> DB : create PronunciationAttempt(audio_file)
+  View -> Pron : assess_attempt(attempt)
+  Pron -> Pron : get_pronunciation_backend()\nfrom PRONUNCIATION_BACKEND + AiModel.active()
+  Pron -> Engine : assess(audio_path, reference_text)
+  alt real engine
+    Engine -> Audio : transcode_to_wav16k (ffmpeg, PCM 16k mono)
+    Engine -> Engine : phoneme-level assessment vs reference
+  else mock (default dev)
+    Engine -> Engine : deterministic scores from audio digest\n(same recording -> same score)
+  end
+  Engine --> Pron : {overall, accuracy, fluency,\ncompleteness, prosody, words[], engine}
+  Pron -> DB : persist scores + word_results + engine_metadata
+  alt engine misconfigured / unreachable
+    Pron --> View : RuntimeError / GeminiError
+    View --> API : 400 or 503
+    note right of DB : attempt row survives with null scores,\nso a fixed deploy can re-score it
+  else
+    View --> API : 201 Created - the scored attempt itself
+    note right of View : synchronous by design:\nthe 201 body IS the result, no polling
+    API --> UI : PronunciationAttempt
+    UI --> Student : AttemptResult (per-word colouring)\n+ updated AttemptHistory
+  end
+end
+@enduml

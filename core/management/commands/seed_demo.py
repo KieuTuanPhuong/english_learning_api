@@ -6,6 +6,12 @@ Usage:
 Wipes all rows then inserts a realistic demo dataset. Password for everyone
 is "password123". The admin user is also a Django superuser (is_staff +
 is_superuser) so it can log into /admin/.
+
+Also stocks the mock-test library and practice catalog (seed_mock_tests,
+seed_exercise_catalog) and books meetings: two rooms are open and ready to
+join (English 101: emma + alice; IELTS Prep: sophie + george), one is
+scheduled for tomorrow and two have ended. A room's clock starts when the
+first peer joins, so the ready rooms show no elapsed time until then.
 """
 
 from datetime import date, timedelta
@@ -28,6 +34,9 @@ from core.models import (
     Feedback,
     LearningModule,
     LessonPlan,
+    Meeting,
+    MeetingStatus,
+    MockTestTemplate,
     PronunciationAttempt,
     PronunciationDrill,
     Question,
@@ -36,6 +45,7 @@ from core.models import (
     Submission,
     SubmissionType,
     SubmissionStatus,
+    TestAttempt,
     Topic,
     User,
     UserRole,
@@ -131,6 +141,11 @@ class Command(BaseCommand):
         # Children first; cascades cover the rest, but be explicit.
         Feedback.objects.all().delete()
         Submission.objects.all().delete()
+        # Mock-test rows PROTECT their exercises and templates; drop them before
+        # the Exercise wipe (seed_mock_tests restocks the library below).
+        TestAttempt.objects.all().delete()
+        MockTestTemplate.objects.all().delete()
+        Meeting.objects.all().delete()
         Assignment.objects.all().delete()
         # Drills survive the User wipe (created_by is SET_NULL) — wipe explicitly.
         PronunciationAttempt.objects.all().delete()
@@ -691,10 +706,44 @@ class Command(BaseCommand):
             updated_by=admin,
         )
 
+        # ---------- Meetings ----------
+        # started_at stays null on the open rooms: the first peer to join stamps
+        # it (MeetingSignalConsumer), so the call timer starts at zero.
+        self.stdout.write("Seeding meetings…")
+        tomorrow_10am = (timezone.localtime(now) + timedelta(days=1)).replace(
+            hour=10, minute=0, second=0, microsecond=0)
+        Meeting.objects.bulk_create([
+            Meeting(klass=classes[0], created_by=teachers[0],
+                    title="Speaking practice — ordering at a cafe",
+                    status=MeetingStatus.ACTIVE),
+            Meeting(klass=classes[3], created_by=teachers[2],
+                    title="IELTS Speaking Part 2 — mock interview",
+                    status=MeetingStatus.ACTIVE),
+            Meeting(klass=classes[2], created_by=teachers[1],
+                    title="Small-talk clinic",
+                    status=MeetingStatus.SCHEDULED, scheduled_at=tomorrow_10am),
+            Meeting(klass=classes[0], created_by=teachers[0],
+                    title="Week 1 check-in",
+                    status=MeetingStatus.ENDED,
+                    started_at=now - timedelta(days=3, minutes=25),
+                    ended_at=now - timedelta(days=3)),
+            Meeting(klass=classes[3], created_by=teachers[2],
+                    title="Band 7 speaking tips",
+                    status=MeetingStatus.ENDED,
+                    started_at=now - timedelta(days=6, minutes=40),
+                    ended_at=now - timedelta(days=6)),
+        ])
+
         # ---------- Rubric templates (docs/research/02-scoring-rubrics.md) ----------
         # Idempotent + additive: keyed on slug, not wiped above, safe to re-run.
         self.stdout.write("Seeding rubric templates…")
         call_command("seed_rubrics")
+
+        # ---------- Mock-test library + practice catalog ----------
+        # Both idempotent; seed_mock_tests also (re)writes the test formats.
+        self.stdout.write("Seeding mock tests and practice catalog…")
+        call_command("seed_mock_tests")
+        call_command("seed_exercise_catalog")
 
         self.stdout.write(self.style.SUCCESS("\n=== Seed complete ==="))
         self.stdout.write(
@@ -712,9 +761,15 @@ class Command(BaseCommand):
         self.stdout.write(f"  Progress:         {StudentModuleProgress.objects.count():>4}")
         self.stdout.write(f"  Study Materials:  {StudyMaterial.objects.count():>4}")
         self.stdout.write(f"  Pron. Drills:     {PronunciationDrill.objects.count():>4}")
+        self.stdout.write(f"  Mock Tests:       {MockTestTemplate.objects.count():>4}")
+        self.stdout.write(f"  Meetings:         {Meeting.objects.count():>4}"
+                          f"  ({Meeting.objects.filter(status=MeetingStatus.ACTIVE).count()} ready to join)")
         self.stdout.write(f"  AI Models:        {AiModel.objects.count():>4}")
         self.stdout.write(f"  System Logs:      {SystemLog.objects.count():>4}")
         self.stdout.write("\nLogin (password for everyone): password123")
         self.stdout.write("  Admin:    admin@english.app  (also Django /admin/ superuser)")
         self.stdout.write("  Teachers: emma/david/sophie .teacher@english.app")
         self.stdout.write("  Students: alice … luna .student@english.app")
+        self.stdout.write("\nMeetings ready to join (/meetings, one teacher + one student per room):")
+        self.stdout.write("  English 101:  emma.teacher@english.app   + alice.student@english.app")
+        self.stdout.write("  IELTS Prep:   sophie.teacher@english.app + george.student@english.app")

@@ -8,35 +8,27 @@
 ' FLOW 1 — REGISTER (with auto-login)
 '==================================================================
 @startuml register
-title Register (POST /api/auth/register) + auto-login
+title Register - create the account, then log in automatically
 autonumber
+hide footbox
 
 actor User
-participant "RegisterPage\n(app/(auth)/register)" as Page
-participant "api.ts\n(API client)" as API
-participant "RegisterView\n(core/views.py)" as View
-participant "RegisterSerializer\n(core/serializers.py)" as Ser
-database "User table\n(core/models.py)" as DB
+participant "Web\n(register page)" as Web
+participant "API" as API
+database DB
 
-User -> Page : fill full_name, email,\npassword, role
-Page -> API : register({full_name,email,password,role})
-API -> View : POST /api/auth/register
-View -> Ser : validate(payload)
-Ser -> DB : email unique? (check)
-alt email already exists
-  Ser --> View : ValidationError
-  View --> API : 400 Bad Request
-  API --> Page : error
-  Page --> User : show "email taken"
-else valid
-  Ser -> DB : User.objects.create_user()\n(set_password → PBKDF2 hash)
-  DB --> Ser : User (status=ACTIVE)
-  Ser --> View : User
-  View --> API : 201 Created (UserSerializer)
-  API -> API : auto-call login(email,password)
-  note right of API : continues into LOGIN flow
-  API --> Page : User
-  Page --> User : redirect to app
+User -> Web : full name, email, password, role
+Web -> API : POST /api/auth/register
+API -> DB : is this email already used?
+alt email taken
+  API --> Web : 400 "Email already registered"
+  Web --> User : show the error, keep the form
+else available
+  API -> DB : create user (password hashed, status active)
+  API --> Web : 201 Created (user, no token yet)
+  Web -> API : POST /api/auth/login (same credentials)
+  API --> Web : access + refresh token
+  Web --> User : signed in, redirected into the app
 end
 @enduml
 
@@ -44,45 +36,36 @@ end
 ' FLOW 2 — LOGIN
 '==================================================================
 @startuml login
-title Login (POST /api/auth/login) — JWT issue
+title Login - get a token, then keep it fresh
 autonumber
+hide footbox
 
 actor User
-participant "LoginPage\n(app/(auth)/login)" as Page
-participant "api.ts\n(API client)" as API
-participant "LoginView\n(core/views.py)" as View
-participant "Django authenticate()" as Auth
-participant "SimpleJWT\nRefreshToken.for_user" as JWT
-database "User table" as DB
+participant "Web\n(login page)" as Web
+participant "API" as API
+database DB
 
-User -> Page : enter email, password
-Page -> API : login(email, password)
-API -> View : POST /api/auth/login
-View -> Auth : authenticate(username=email, password)
-Auth -> DB : fetch user + verify hash
-alt invalid credentials
-  Auth --> View : None
-  View --> API : 401 AuthenticationFailed\n"Incorrect email or password"
-  API --> Page : error
-  Page --> User : show error
-else valid
-  Auth --> View : User
-  View -> JWT : RefreshToken.for_user(user)
-  JWT --> View : access (60 min) + refresh (7 d)
-  View --> API : 200 {access_token, refresh_token,\ntoken_type:"bearer"}
-  API -> API : setAccessToken() → memory\nsetRefreshToken() → localStorage[elw_refresh_token]
-  API -> View : GET /api/auth/me (Bearer access)
-  View --> API : current User
-  API --> Page : User
-  Page --> User : redirect to app
+User -> Web : email + password
+Web -> API : POST /api/auth/login
+API -> DB : find the user, verify the password hash
+alt wrong email or password
+  API --> Web : 401 "Incorrect email or password"
+  Web --> User : show the error
+else correct
+  API --> Web : 200 access token (60 min)\n+ refresh token (7 days)
+  Web -> Web : access token in memory,\nrefresh token in localStorage
+  Web -> API : GET /api/auth/me
+  API --> Web : current user
+  Web --> User : signed in, redirected into the app
 end
 
-== later: access expires (any request → 401) ==
-API -> View : POST /api/auth/token/refresh {refresh}
-View -> JWT : validate + rotate
-JWT --> View : new access (+ refresh)
-View --> API : 200 new tokens
-API -> API : retry original request transparently
+== later: the access token has expired ==
+Web -> API : any request, expired access token
+API --> Web : 401
+Web -> API : POST /api/auth/token/refresh
+API --> Web : a new access token
+Web -> API : retry the original request
+note right of Web : the user never sees this.\nIf the refresh fails too, both tokens\nare cleared and the session ends.
 @enduml
 
 '==================================================================

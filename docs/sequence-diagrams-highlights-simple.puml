@@ -1,0 +1,102 @@
+' English Learning Platform - 3 Highlight Features (SLIDE VERSION)
+' Short diagrams for presenting. Full detail: sequence-diagrams-highlights.puml
+' Render at https://plantuml.com/
+
+'==================================================================
+' HIGHLIGHT 1 - Mock test: the server owns the clock
+'==================================================================
+@startuml mock-test-simple
+title Highlight 1 - Mock test: the server owns the clock
+autonumber
+hide footbox
+
+actor Student
+participant "Web\n(SectionRunner)" as Web
+participant "API\n(mock_tests.py)" as API
+database DB
+
+Student -> Web : Start section
+Web -> API : POST .../sections/{id}/start/
+API -> DB : expires_at = now + duration + 30s
+API --> Web : expires_at + server_time
+note right of Web : client only renders the countdown
+
+loop while answering
+  Student -> Web : type / choose answer
+  Web -> API : PATCH .../answers/ (debounced 3s)
+  API --> Web : saved
+end
+
+Web -> API : PATCH .../answers/ (after time is up)
+API --> Web : 409 section_expired
+Web -> Web : lock the section
+
+Student -> Web : Submit
+Web -> API : POST .../sections/{id}/submit/
+API -> DB : grade answers, raw score -> band
+API -> API : queue AI grading
+API --> Web : section completed
+@enduml
+
+'==================================================================
+' HIGHLIGHT 2 - AI grading in the background
+'==================================================================
+@startuml ai-grading-simple
+title Highlight 2 - AI grading runs in the background
+autonumber
+hide footbox
+
+actor Student
+participant "Web\n(report page)" as Web
+participant "API" as API
+participant "AI worker" as Worker
+participant "LLM\n(Gemini / NVIDIA)" as LLM
+database DB
+
+API -> DB : claim sections (lock, skip locked)
+note right of API : no section is graded twice
+API -> Worker : grade in background thread
+
+Student -> Web : open report
+Web -> API : GET /attempts/{id}/report/
+API --> Web : bands so far + ai_status
+
+Worker -> LLM : explain mistakes (Reading / Listening)
+Worker -> LLM : score essay / speaking vs rubric
+LLM --> Worker : explanations + scores
+Worker -> DB : save insights, feedback, section band
+Worker -> DB : ai_status = done
+
+loop every 4s while status = running
+  Web -> API : GET report
+  API --> Web : updated bands
+end
+Web --> Student : full report
+@enduml
+
+'==================================================================
+' HIGHLIGHT 3 - Pronunciation: record and get scored
+'==================================================================
+@startuml pronunciation-simple
+title Highlight 3 - Pronunciation: record and get scored
+autonumber
+hide footbox
+
+actor Student
+participant "Web\n(recorder)" as Web
+participant "API" as API
+participant "Speech engine\n(Azure / Gemini / Mock)" as Engine
+database DB
+
+Student -> Web : press Record, read the target text
+Web -> Web : capture audio + live level meter
+Student -> Web : press Stop
+Web -> API : POST .../drills/{id}/attempts/ (audio file)
+API -> API : check rate limit, size, type, duration
+API -> DB : save attempt
+API -> Engine : assess(audio, target text)
+Engine --> API : accuracy, fluency, completeness,\nprosody, per-word scores
+API -> DB : save scores
+API --> Web : 201 - the scored attempt
+Web --> Student : result + word colouring + history
+@enduml
