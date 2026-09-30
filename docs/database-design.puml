@@ -1,0 +1,641 @@
+' English Learning Platform - Database Design (PostgreSQL)
+' Source of truth: core/models.py (32 app tables, bigint PKs, 13 migrations).
+' Render at https://plantuml.com/ - one @startuml..@enduml block at a time.
+'
+' Legend:  * = NOT NULL   <<PK>> primary key   <<FK>> foreign key
+'          ||--o{  one to many       |o--o{  optional parent (nullable FK)
+'          ||--o|  one to one (optional on the child side)
+
+'==================================================================
+' DIAGRAM 0 - OVERVIEW (slide version): tables + relationships only
+' Provenance links (created_by / uploaded_by / updated_by -> users)
+' are left out to keep it readable; see the detailed diagrams.
+'==================================================================
+@startuml db-overview
+title Database overview - 32 tables in 7 domains
+hide circle
+hide empty members
+skinparam packageStyle rectangle
+left to right direction
+
+package "Identity & Admin" #F3F6FA {
+  entity users
+  entity ai_models
+  entity system_logs
+}
+
+package "Classroom" #F4FAF3 {
+  entity classes
+  entity class_students_lnk
+  entity lesson_plans
+  entity assignments
+  entity study_materials
+  entity meetings
+}
+
+package "Content" #FFF8EC {
+  entity learning_modules
+  entity student_module_progress
+  entity exercises
+  entity questions
+  entity question_options
+}
+
+package "Submissions & Feedback" #FDF1F1 {
+  entity submissions
+  entity feedback
+  entity ai_insights
+  entity writing_annotations
+}
+
+package "Rubrics" #F6F1FB {
+  entity rubric_templates
+  entity rubric_criteria
+  entity rubric_band_descriptors
+  entity criterion_scores
+}
+
+package "Mock Tests" #EEF7F8 {
+  entity test_formats
+  entity score_conversion_tables
+  entity mock_test_templates
+  entity test_sections
+  entity test_section_exercises_lnk
+  entity test_attempts
+  entity section_attempts
+  entity section_submissions_lnk
+}
+
+package "Pronunciation" #FAF6EE {
+  entity pronunciation_drills
+  entity pronunciation_attempts
+}
+
+users ||--o{ classes : teaches
+users ||--o{ class_students_lnk : enrolled
+classes ||--o{ class_students_lnk
+classes ||--o{ lesson_plans
+classes ||--o{ assignments
+classes |o--o{ study_materials
+classes ||--o{ meetings
+
+learning_modules |o--o{ exercises
+learning_modules ||--o{ student_module_progress
+users ||--o{ student_module_progress
+exercises ||--o{ questions
+questions ||--o{ question_options
+exercises ||--o{ assignments
+
+users ||--o{ submissions : submits
+exercises ||--o{ submissions
+assignments |o--o{ submissions
+submissions ||--o{ feedback
+submissions ||--o{ ai_insights
+submissions ||--o{ writing_annotations
+
+rubric_templates |o--o{ exercises : pinned rubric
+rubric_templates ||--o{ rubric_criteria
+rubric_criteria ||--o{ rubric_band_descriptors
+rubric_criteria ||--o{ criterion_scores
+feedback ||--o{ criterion_scores
+
+test_formats ||--o{ score_conversion_tables
+test_formats ||--o{ mock_test_templates
+mock_test_templates ||--o{ test_sections
+test_sections ||--o{ test_section_exercises_lnk
+exercises ||--o{ test_section_exercises_lnk
+mock_test_templates ||--o{ test_attempts
+users ||--o{ test_attempts : sits
+test_attempts ||--o{ section_attempts
+test_sections ||--o{ section_attempts
+section_attempts ||--o{ section_submissions_lnk
+submissions ||--o| section_submissions_lnk
+
+learning_modules |o--o{ pronunciation_drills
+pronunciation_drills ||--o{ pronunciation_attempts
+users ||--o{ pronunciation_attempts : records
+@enduml
+
+'==================================================================
+' DIAGRAM 1 - Identity, Classroom & Admin
+'==================================================================
+@startuml db-classroom
+title Detail 1 - Identity, Classroom & Admin
+hide circle
+
+entity "users" as users {
+  *id : bigint <<PK>>
+  --
+  *email : varchar(255) <<unique>>
+  *password : varchar(128)
+  *full_name : varchar(100)
+  avatar_url : varchar(500)
+  *role : varchar(20)  -- student | teacher | admin
+  *status : varchar(20)  -- active | suspended ...
+  *is_active : bool
+  *is_staff : bool
+  *is_superuser : bool
+  last_login : timestamptz
+  *created_at : timestamptz
+  *updated_at : timestamptz
+}
+
+entity "classes" as classes {
+  *id : bigint <<PK>>
+  --
+  *class_name : varchar(100)
+  *teacher_id : bigint <<FK users, PROTECT>>
+  academic_year : varchar(20)
+  *created_at : timestamptz
+}
+
+entity "class_students_lnk" as cs {
+  *id : bigint <<PK>>
+  --
+  *klass_id : bigint <<FK classes>>
+  *student_id : bigint <<FK users>>
+  *joined_at : timestamptz
+  ..
+  UNIQUE (klass_id, student_id)
+}
+
+entity "lesson_plans" as lp {
+  *id : bigint <<PK>>
+  --
+  *klass_id : bigint <<FK classes>>
+  *title : varchar(255)
+  objectives : text
+  start_date : date
+  end_date : date
+  *created_at : timestamptz
+}
+
+entity "assignments" as asg {
+  *id : bigint <<PK>>
+  --
+  *klass_id : bigint <<FK classes>>
+  *exercise_id : bigint <<FK exercises>>
+  assigned_by_id : bigint <<FK users, SET NULL>>
+  due_date : timestamptz
+  *created_at : timestamptz
+}
+
+entity "study_materials" as sm {
+  *id : bigint <<PK>>
+  --
+  *title : varchar(200)
+  *file_url : varchar(255)
+  description : text
+  uploaded_by_id : bigint <<FK users, SET NULL>>
+  klass_id : bigint <<FK classes>>  -- null = global library
+  *created_at : timestamptz
+}
+
+entity "meetings" as mt {
+  *id : bigint <<PK>>
+  --
+  *klass_id : bigint <<FK classes>>
+  created_by_id : bigint <<FK users, SET NULL>>
+  *title : varchar(255)
+  *status : varchar(20)  -- scheduled | active | ended
+  scheduled_at : timestamptz
+  started_at : timestamptz
+  ended_at : timestamptz
+  *created_at : timestamptz
+}
+
+entity "ai_models" as aim {
+  *id : bigint <<PK>>
+  --
+  *model_name : varchar(100)
+  *endpoint_url : varchar(255)
+  *version_identifier : varchar(50)
+  *is_active : bool
+  *strictness : varchar(20)  -- lenient | standard | strict
+  updated_by_id : bigint <<FK users, SET NULL>>
+  *updated_at : timestamptz
+}
+
+entity "system_logs" as sl {
+  *id : bigint <<PK>>
+  --
+  admin_id : bigint <<FK users, SET NULL>>
+  *action_description : text
+  target_status : varchar(50)
+  *timestamp : timestamptz
+}
+
+entity "exercises" as ex {
+  *id : bigint <<PK>>
+  .. see Detail 2 ..
+}
+
+users ||--o{ classes : teaches
+users ||--o{ cs : enrolled
+classes ||--o{ cs
+classes ||--o{ lp
+classes ||--o{ asg
+ex ||--o{ asg
+users |o--o{ asg : assigned_by
+classes |o--o{ sm
+users |o--o{ sm : uploaded_by
+classes ||--o{ mt
+users |o--o{ mt : created_by
+users |o--o{ aim : updated_by
+users |o--o{ sl : admin
+@enduml
+
+'==================================================================
+' DIAGRAM 2 - Content, Submissions, Feedback & Rubrics
+'==================================================================
+@startuml db-content-grading
+title Detail 2 - Content, Submissions, Feedback & Rubrics
+hide circle
+
+entity "users" as users {
+  *id : bigint <<PK>>
+  .. see Detail 1 ..
+}
+entity "assignments" as asg {
+  *id : bigint <<PK>>
+  .. see Detail 1 ..
+}
+
+entity "learning_modules" as lm {
+  *id : bigint <<PK>>
+  --
+  *title : varchar(255)
+  description : text
+  difficulty_level : varchar(20)
+  band : varchar(20)
+  topic : varchar(20)
+  created_by_id : bigint <<FK users, SET NULL>>
+  *created_at : timestamptz
+}
+
+entity "student_module_progress" as smp {
+  *id : bigint <<PK>>
+  --
+  *student_id : bigint <<FK users>>
+  *module_id : bigint <<FK learning_modules>>
+  *completion_percentage : numeric(5,2)
+  last_accessed_at : timestamptz
+  ..
+  UNIQUE (student_id, module_id)
+}
+
+entity "exercises" as ex {
+  *id : bigint <<PK>>
+  --
+  module_id : bigint <<FK learning_modules>>
+  *title : varchar(255)
+  *exercise_type : varchar(20)  -- reading | listening | writing | speaking | quiz
+  band : varchar(20)
+  topic : varchar(20)
+  *prompt_text : text
+  content_text : text  -- reading passage
+  audio_prompt_url : varchar(500)
+  created_by_id : bigint <<FK users, SET NULL>>
+  rubric_template_id : bigint <<FK rubric_templates, SET NULL>>
+  *created_at : timestamptz
+}
+
+entity "questions" as q {
+  *id : bigint <<PK>>
+  --
+  *exercise_id : bigint <<FK exercises>>
+  *text : text
+  *order : int
+  max_words : smallint  -- IELTS "no more than N words"
+  *created_at : timestamptz
+}
+
+entity "question_options" as qo {
+  *id : bigint <<PK>>
+  --
+  *question_id : bigint <<FK questions>>
+  *text : varchar(500)
+  *is_correct : bool  -- the answer key
+  *order : int
+}
+
+entity "submissions" as sub {
+  *id : bigint <<PK>>
+  --
+  assignment_id : bigint <<FK assignments, SET NULL>>  -- null = self-practice
+  *exercise_id : bigint <<FK exercises>>
+  *student_id : bigint <<FK users>>
+  *submission_type : varchar(20)
+  writing_text : text  -- immutable after submit
+  audio_recording_url : text
+  answers : jsonb  -- {question_id: {option_ids, text}}
+  auto_score : numeric(5,2)
+  *status : varchar(20)  -- pending | graded ...
+  *submitted_at : timestamptz
+}
+
+entity "feedback" as fb {
+  *id : bigint <<PK>>
+  --
+  *submission_id : bigint <<FK submissions>>
+  reviewer_id : bigint <<FK users, SET NULL>>
+  score : numeric(5,2)  -- normalised 0-100
+  comments : text
+  *is_ai_generated : bool
+  *created_at : timestamptz
+}
+
+entity "ai_insights" as ai {
+  *id : bigint <<PK>>
+  --
+  *submission_id : bigint <<FK submissions>>
+  *kind : varchar(30)  -- mistake_explanation | feedback_review
+  *payload : jsonb
+  *engine : varchar(80)
+  requested_by_id : bigint <<FK users, SET NULL>>
+  *created_at : timestamptz
+  ..
+  INDEX (submission_id, kind, created_at DESC)
+}
+
+entity "writing_annotations" as wa {
+  *id : bigint <<PK>>
+  --
+  *submission_id : bigint <<FK submissions>>
+  author_id : bigint <<FK users, SET NULL>>
+  *start_offset : int
+  *end_offset : int  -- exclusive
+  *quoted_text : text
+  *category : varchar(20)  -- grammar | vocabulary | ...
+  *comment : text
+  suggested_correction : text
+  *is_acknowledged : bool
+  *created_at : timestamptz
+  *updated_at : timestamptz
+  ..
+  CHECK (end_offset > start_offset)
+}
+
+entity "rubric_templates" as rt {
+  *id : bigint <<PK>>
+  --
+  *name : varchar(100)
+  *slug : varchar(60) <<unique>>
+  description : text
+  *exercise_type : varchar(20)
+  *is_default_for_type : bool
+  *scale_min : numeric(5,1)
+  *scale_max : numeric(5,1)
+  *score_step : numeric(4,1)
+  *aggregation : varchar(20)  -- mean_down_half | mean | sum ...
+  *is_active : bool
+  created_by_id : bigint <<FK users, SET NULL>>
+  *created_at : timestamptz
+  ..
+  UNIQUE (exercise_type)
+    WHERE is_default_for_type AND is_active
+}
+
+entity "rubric_criteria" as rc {
+  *id : bigint <<PK>>
+  --
+  *template_id : bigint <<FK rubric_templates>>
+  *name : varchar(100)
+  *code : varchar(50)
+  description : text
+  *weight : numeric(4,2)
+  *order : int
+  ..
+  UNIQUE (template_id, code)
+}
+
+entity "rubric_band_descriptors" as rbd {
+  *id : bigint <<PK>>
+  --
+  *criterion_id : bigint <<FK rubric_criteria>>
+  *band_value : numeric(5,1)
+  *label : varchar(50)
+  *descriptor : text
+  ..
+  UNIQUE (criterion_id, band_value)
+}
+
+entity "criterion_scores" as cs {
+  *id : bigint <<PK>>
+  --
+  *feedback_id : bigint <<FK feedback>>
+  *criterion_id : bigint <<FK rubric_criteria, PROTECT>>
+  *score : numeric(5,1)
+  note : text
+  ..
+  UNIQUE (feedback_id, criterion_id)
+}
+
+lm ||--o{ smp
+users ||--o{ smp
+lm |o--o{ ex
+ex ||--o{ q
+q ||--o{ qo
+rt |o--o{ ex : pinned rubric
+ex ||--o{ sub
+users ||--o{ sub : submits
+asg |o--o{ sub
+sub ||--o{ fb
+users |o--o{ fb : reviewer (null = AI)
+sub ||--o{ ai
+sub ||--o{ wa
+users |o--o{ wa : author
+rt ||--o{ rc
+rc ||--o{ rbd
+fb ||--o{ cs
+rc ||--o{ cs
+@enduml
+
+'==================================================================
+' DIAGRAM 3 - Mock Tests
+'==================================================================
+@startuml db-mock-tests
+title Detail 3 - Mock Tests (authoring side -> sitting side)
+hide circle
+
+entity "users" as users {
+  *id : bigint <<PK>>
+  .. see Detail 1 ..
+}
+entity "exercises" as ex {
+  *id : bigint <<PK>>
+  .. see Detail 2 ..
+}
+entity "submissions" as sub {
+  *id : bigint <<PK>>
+  .. see Detail 2 ..
+}
+
+entity "test_formats" as tf {
+  *id : bigint <<PK>>
+  --
+  *slug : varchar(50) <<unique>>  -- ielts-academic, toeic ...
+  *name : varchar(100)
+  *version : varchar(20)
+  *overall_strategy : varchar(20)  -- band_average | scaled_sum | mean_percent
+  *score_precision : numeric(4,2)
+  *is_active : bool
+}
+
+entity "score_conversion_tables" as sct {
+  *id : bigint <<PK>>
+  --
+  *format_id : bigint <<FK test_formats>>
+  *skill : varchar(20)
+  *mapping : jsonb  -- {"39": "9.0", "37": "8.5", ...}
+  source_note : varchar(255)
+  *updated_at : timestamptz
+  ..
+  UNIQUE (format_id, skill)
+}
+
+entity "mock_test_templates" as mtt {
+  *id : bigint <<PK>>
+  --
+  *format_id : bigint <<FK test_formats, PROTECT>>
+  *title : varchar(255)
+  description : text
+  difficulty_level : varchar(20)
+  created_by_id : bigint <<FK users, SET NULL>>
+  *created_at : timestamptz
+}
+
+entity "test_sections" as ts {
+  *id : bigint <<PK>>
+  --
+  *template_id : bigint <<FK mock_test_templates>>
+  *skill : varchar(20)  -- listening | reading | writing | speaking
+  *title : varchar(100)
+  *order : int
+  *duration_minutes : int
+  instructions : text
+  *item_flow : varchar(20)  -- free | sequential
+  ..
+  UNIQUE (template_id, order)
+}
+
+entity "test_section_exercises_lnk" as tse {
+  *id : bigint <<PK>>
+  --
+  *section_id : bigint <<FK test_sections>>
+  *exercise_id : bigint <<FK exercises, PROTECT>>
+  *order : int
+  *weight : numeric(4,2)  -- Writing Task 2 = 2
+  prep_seconds : int
+  max_record_seconds : int
+  ..
+  UNIQUE (section_id, exercise_id)
+}
+
+entity "test_attempts" as ta {
+  *id : bigint <<PK>>
+  --
+  *template_id : bigint <<FK mock_test_templates, PROTECT>>
+  *student_id : bigint <<FK users>>
+  *status : varchar(20)  -- in_progress | completed | abandoned
+  *mode : varchar(20)  -- exam | practice
+  *started_at : timestamptz
+  completed_at : timestamptz
+  overall_score : numeric(6,2)
+}
+
+entity "section_attempts" as sa {
+  *id : bigint <<PK>>
+  --
+  *attempt_id : bigint <<FK test_attempts>>
+  *section_id : bigint <<FK test_sections, PROTECT>>
+  *status : varchar(20)  -- not_started | in_progress | completed
+  started_at : timestamptz
+  expires_at : timestamptz  -- server clock
+  completed_at : timestamptz
+  draft_answers : jsonb  -- autosave envelope
+  raw_score : int
+  raw_max : int
+  converted_score : numeric(6,2)
+  *ai_status : varchar(20)  -- pending | running | done | failed
+  ai_started_at : timestamptz
+  ai_finished_at : timestamptz
+  *ai_error : text
+  ..
+  UNIQUE (attempt_id, section_id)
+}
+
+entity "section_submissions_lnk" as ssl {
+  *id : bigint <<PK>>
+  --
+  *section_attempt_id : bigint <<FK section_attempts>>
+  *submission_id : bigint <<FK submissions, unique>>
+}
+
+tf ||--o{ sct
+tf ||--o{ mtt
+users |o--o{ mtt : created_by
+mtt ||--o{ ts
+ts ||--o{ tse
+ex ||--o{ tse
+mtt ||--o{ ta
+users ||--o{ ta : sits
+ta ||--o{ sa
+ts ||--o{ sa
+sa ||--o{ ssl
+sub ||--o| ssl
+@enduml
+
+'==================================================================
+' DIAGRAM 4 - Pronunciation
+'==================================================================
+@startuml db-pronunciation
+title Detail 4 - Pronunciation practice
+hide circle
+
+entity "users" as users {
+  *id : bigint <<PK>>
+  .. see Detail 1 ..
+}
+entity "learning_modules" as lm {
+  *id : bigint <<PK>>
+  .. see Detail 2 ..
+}
+
+entity "pronunciation_drills" as pd {
+  *id : bigint <<PK>>
+  --
+  *target_text : varchar(255)
+  contrast_text : varchar(255)  -- minimal pair
+  phoneme_hint : varchar(255)  -- IPA
+  *drill_type : varchar(20)  -- word | sentence | minimal_pair
+  difficulty_level : varchar(20)
+  module_id : bigint <<FK learning_modules>>
+  created_by_id : bigint <<FK users, SET NULL>>
+  *created_at : timestamptz
+}
+
+entity "pronunciation_attempts" as pa {
+  *id : bigint <<PK>>
+  --
+  *drill_id : bigint <<FK pronunciation_drills>>
+  *student_id : bigint <<FK users>>
+  *audio_file : varchar(100)  -- pronunciation/YYYY/MM/...
+  overall_score : numeric(5,2)
+  accuracy_score : numeric(5,2)
+  fluency_score : numeric(5,2)
+  completeness_score : numeric(5,2)
+  prosody_score : numeric(5,2)
+  word_results : jsonb  -- per word, nested phonemes
+  *engine : varchar(50)
+  engine_metadata : jsonb
+  *created_at : timestamptz
+  ..
+  INDEX (student_id, drill_id, created_at DESC)
+}
+
+lm |o--o{ pd
+users |o--o{ pd : created_by
+pd ||--o{ pa
+users ||--o{ pa : records
+@enduml
